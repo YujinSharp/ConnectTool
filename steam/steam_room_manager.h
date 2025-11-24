@@ -48,8 +48,6 @@ public:
     void leaveLobby();
     bool searchLobbies();
     bool joinLobby(CSteamID lobbyID);
-    bool startHosting();
-    void stopHosting();
 
     CSteamID getCurrentLobby() const { return currentLobby; }
     const std::vector<CSteamID>& getLobbies() const { return lobbies; }

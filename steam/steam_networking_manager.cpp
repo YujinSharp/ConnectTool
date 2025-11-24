@@ -108,14 +108,6 @@ void SteamNetworkingManager::shutdown()
     SteamAPI_Shutdown();
 }
 
-bool SteamNetworkingManager::joinHost(uint64 hostID)
-{
-    CSteamID hostSteamID(hostID);
-    g_isClient = true;
-    g_hostSteamID = hostSteamID;
-    return connectToPeer(hostSteamID);
-}
-
 bool SteamNetworkingManager::connectToPeer(CSteamID peerID)
 {
     // Check if already connected to this peer
@@ -147,8 +139,8 @@ bool SteamNetworkingManager::connectToPeer(CSteamID peerID)
         std::lock_guard<std::mutex> lock(connectionsMutex);
         peerConnections_[peerID] = conn;
         
-        // Set as main connection if it's the host
-        if (peerID == g_hostSteamID)
+        // Set as main connection if this is the first connection
+        if (g_hConnection == k_HSteamNetConnection_Invalid)
         {
             g_hConnection = conn;
         }
@@ -188,20 +180,10 @@ void SteamNetworkingManager::disconnect()
     }
     
     // Reset state
-    g_isHost = false;
-    g_isClient = false;
     g_isConnected = false;
     hostPing_ = 0;
     
     std::cout << "Disconnected from network" << std::endl;
-}
-
-void SteamNetworkingManager::setMessageHandlerDependencies(boost::asio::io_context &io_context, std::unique_ptr<TCPServer> &server, int &localPort)
-{
-    io_context_ = &io_context;
-    server_ = &server;
-    localPort_ = &localPort;
-    messageHandler_ = new SteamMessageHandler(io_context, m_pInterface, connections, connectionsMutex, g_isHost, localPort);
 }
 
 void SteamNetworkingManager::startMessageHandler()
@@ -295,8 +277,8 @@ void SteamNetworkingManager::handleConnectionStatusChanged(SteamNetConnectionSta
         connections.push_back(pInfo->m_hConn);
         peerConnections_[remoteSteamID] = pInfo->m_hConn;
         
-        // Set as main connection if it's from the host
-        if (remoteSteamID == g_hostSteamID)
+        // Set as main connection if this is the first connection
+        if (g_hConnection == k_HSteamNetConnection_Invalid)
         {
             g_hConnection = pInfo->m_hConn;
         }
@@ -337,7 +319,8 @@ void SteamNetworkingManager::handleConnectionStatusChanged(SteamNetConnectionSta
         SteamNetConnectionRealTimeStatus_t status;
         if (m_pInterface->GetConnectionInfo(pInfo->m_hConn, &info) && m_pInterface->GetConnectionRealTimeStatus(pInfo->m_hConn, &status, 0, nullptr))
         {
-            if (remoteSteamID == g_hostSteamID)
+            // Update host ping if this is the main connection
+            if (pInfo->m_hConn == g_hConnection)
             {
                 hostPing_ = status.m_nPing;
             }

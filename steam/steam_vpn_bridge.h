@@ -156,6 +156,9 @@ private:
     // 从IP包中提取源地址
     static uint32_t extractSourceIP(const uint8_t* packet, size_t length);
 
+    // 从SteamID生成确定的IP地址
+    uint32_t generateIPFromSteamID(CSteamID steamID);
+
     // Steam网络管理器
     SteamNetworkingManager* steamManager_;
 

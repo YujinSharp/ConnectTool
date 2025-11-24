@@ -33,14 +33,11 @@ public:
     bool initialize();
     void shutdown();
 
-    // Joining
-    bool joinHost(uint64 hostID);
+    // P2P Connection
     bool connectToPeer(CSteamID peerID);
     void disconnect();
 
     // Getters
-    bool isHost() const { return g_isHost; }
-    bool isClient() const { return g_isClient; }
     bool isConnected() const { return g_isConnected; }
     const std::vector<HSteamNetConnection>& getConnections() const { return connections; }
     int getHostPing() const { return hostPing_; }
@@ -52,14 +49,8 @@ public:
     std::string getConnectionRelayInfo(HSteamNetConnection conn) const;
 
     // For SteamRoomManager access
-    std::unique_ptr<TCPServer>*& getServer() { return server_; }
-    int*& getLocalPort() { return localPort_; }
-    boost::asio::io_context*& getIOContext() { return io_context_; }
     HSteamListenSocket& getListenSock() { return hListenSock; }
     ISteamNetworkingSockets* getInterface() { return m_pInterface; }
-    bool& getIsHost() { return g_isHost; }
-
-    void setMessageHandlerDependencies(boost::asio::io_context& io_context, std::unique_ptr<TCPServer>& server, int& localPort);
 
     // Message handler
     void startMessageHandler();
@@ -69,10 +60,6 @@ public:
     // Update user info (ping, relay status)
     void update();
 
-    // For callbacks
-    void setHostSteamID(CSteamID id) { g_hostSteamID = id; }
-    CSteamID getHostSteamID() const { return g_hostSteamID; }
-
     // VPN Bridge
     void setVpnBridge(SteamVpnBridge* vpnBridge) { vpnBridge_ = vpnBridge; }
     SteamVpnBridge* getVpnBridge() { return vpnBridge_; }
@@ -81,13 +68,10 @@ private:
     // Steam API
     ISteamNetworkingSockets* m_pInterface;
 
-    // Hosting
+    // P2P Listening
     HSteamListenSocket hListenSock;
-    bool g_isHost;
-    bool g_isClient;
     bool g_isConnected;
     HSteamNetConnection g_hConnection;
-    CSteamID g_hostSteamID;
 
     // Connections
     std::vector<HSteamNetConnection> connections;
@@ -100,10 +84,7 @@ private:
     const int MAX_RETRIES = 3;
     int g_currentVirtualPort;
 
-    // Message handler dependencies
-    boost::asio::io_context* io_context_;
-    std::unique_ptr<TCPServer>* server_;
-    int* localPort_;
+    // Message handler
     SteamMessageHandler* messageHandler_;
 
     // VPN Bridge

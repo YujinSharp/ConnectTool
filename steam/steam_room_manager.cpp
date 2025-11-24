@@ -16,14 +16,14 @@ void SteamFriendsCallbacks::OnGameLobbyJoinRequested(GameLobbyJoinRequested_t *p
     {
         CSteamID lobbyID = pCallback->m_steamIDLobby;
         std::cout << "Lobby ID: " << lobbyID.ConvertToUint64() << std::endl;
-        if (!manager_->isHost() && !manager_->isConnected())
+        if (!manager_->isConnected())
         {
             std::cout << "Joining lobby from request: " << lobbyID.ConvertToUint64() << std::endl;
             roomManager_->joinLobby(lobbyID);
         }
         else
         {
-            std::cout << "Already host or connected, ignoring lobby join request" << std::endl;
+            std::cout << "Already in a lobby, ignoring lobby join request" << std::endl;
         }
     }
     else
@@ -87,8 +87,6 @@ void SteamMatchmakingCallbacks::OnLobbyEntered(LobbyEnter_t *pCallback)
         
         // Connect to all existing members in the lobby (except ourselves)
         CSteamID mySteamID = SteamUser()->GetSteamID();
-        CSteamID hostID = SteamMatchmaking()->GetLobbyOwner(pCallback->m_ulSteamIDLobby);
-        manager_->setHostSteamID(hostID);
         
         int numMembers = SteamMatchmaking()->GetNumLobbyMembers(pCallback->m_ulSteamIDLobby);
         std::cout << "Connecting to " << numMembers << " lobby members..." << std::endl;
@@ -102,16 +100,6 @@ void SteamMatchmakingCallbacks::OnLobbyEntered(LobbyEnter_t *pCallback)
             {
                 std::cout << "Connecting to member " << memberID.ConvertToUint64() << std::endl;
                 manager_->connectToPeer(memberID);
-            }
-        }
-        
-        // Start TCP Server if dependencies are set and not already started
-        if (manager_->getServer() && !(*manager_->getServer()))
-        {
-            *manager_->getServer() = std::make_unique<TCPServer>(8888, manager_);
-            if (!(*manager_->getServer())->start())
-            {
-                std::cerr << "Failed to start TCP server" << std::endl;
             }
         }
     }
@@ -174,6 +162,16 @@ bool SteamRoomManager::createLobby()
         std::cerr << "Failed to create lobby" << std::endl;
         return false;
     }
+    
+    // Create P2P listen socket
+    networkingManager_->getListenSock() = networkingManager_->getInterface()->CreateListenSocketP2P(0, 0, nullptr);
+    if (networkingManager_->getListenSock() == k_HSteamListenSocket_Invalid)
+    {
+        std::cerr << "Failed to create listen socket" << std::endl;
+        return false;
+    }
+    std::cout << "Created P2P listen socket" << std::endl;
+    
     // Register the call result
     steamMatchmakingCallbacks->m_CallResultLobbyCreated.Set(hSteamAPICall, steamMatchmakingCallbacks, &SteamMatchmakingCallbacks::OnLobbyCreated);
     return true;
@@ -185,6 +183,13 @@ void SteamRoomManager::leaveLobby()
     {
         SteamMatchmaking()->LeaveLobby(currentLobby);
         currentLobby = k_steamIDNil;
+        
+        // Close listen socket
+        if (networkingManager_->getListenSock() != k_HSteamListenSocket_Invalid)
+        {
+            networkingManager_->getInterface()->CloseListenSocket(networkingManager_->getListenSock());
+            networkingManager_->getListenSock() = k_HSteamListenSocket_Invalid;
+        }
         
         // Clear Rich Presence when leaving lobby
         SteamFriends()->ClearRichPresence();
@@ -214,40 +219,6 @@ bool SteamRoomManager::joinLobby(CSteamID lobbyID)
     }
     // Connection will be handled by callback
     return true;
-}
-
-bool SteamRoomManager::startHosting()
-{
-    if (!createLobby())
-    {
-        return false;
-    }
-
-    networkingManager_->getListenSock() = networkingManager_->getInterface()->CreateListenSocketP2P(0, 0, nullptr);
-
-    if (networkingManager_->getListenSock() != k_HSteamListenSocket_Invalid)
-    {
-        networkingManager_->getIsHost() = true;
-        std::cout << "Created listen socket for hosting game room" << std::endl;
-        return true;
-    }
-    else
-    {
-        std::cerr << "Failed to create listen socket for hosting" << std::endl;
-        leaveLobby();
-        return false;
-    }
-}
-
-void SteamRoomManager::stopHosting()
-{
-    if (networkingManager_->getListenSock() != k_HSteamListenSocket_Invalid)
-    {
-        networkingManager_->getInterface()->CloseListenSocket(networkingManager_->getListenSock());
-        networkingManager_->getListenSock() = k_HSteamListenSocket_Invalid;
-    }
-    leaveLobby();
-    networkingManager_->getIsHost() = false;
 }
 
 std::vector<CSteamID> SteamRoomManager::getLobbyMembers() const

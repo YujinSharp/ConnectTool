@@ -48,14 +48,9 @@ bool SteamVpnBridge::start(const std::string& tunDeviceName,
     subnetMask_ = stringToIp(subnetMask);
     nextIP_ = baseIP_ + 1;  // .0 通常保留给网络地址
 
-    // 分配本地IP
-    if (steamManager_->isHost()) {
-        // 主机使用.1
-        localIP_ = baseIP_ + 1;
-    } else {
-        // 客户端稍后从主机获取IP分配
-        localIP_ = 0;
-    }
+    // 根据SteamID分配本地IP（确保每个用户的IP是确定的）
+    CSteamID mySteamID = SteamUser()->GetSteamID();
+    localIP_ = generateIPFromSteamID(mySteamID);
 
     if (localIP_ != 0) {
         // 设置TUN设备IP
@@ -87,8 +82,6 @@ bool SteamVpnBridge::start(const std::string& tunDeviceName,
             std::lock_guard<std::mutex> lock(routingMutex_);
             routingTable_[localIP_] = localRoute;
         }
-
-        allocatedIPs_.push_back(localIP_);
     }
 
     // 设置非阻塞模式
@@ -388,19 +381,12 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
 }
 
 void SteamVpnBridge::onUserJoined(CSteamID steamID, HSteamNetConnection conn) {
-    if (!steamManager_->isHost()) {
-        return;  // 只有主机负责分配IP
-    }
-
-    // 分配IP地址
-    uint32_t newIP = allocateIPAddress();
+    // 生成对方的IP地址（基于SteamID）
+    uint32_t newIP = generateIPFromSteamID(steamID);
     if (newIP == 0) {
-        std::cerr << "Failed to allocate IP for user " << steamID.ConvertToUint64() << std::endl;
+        std::cerr << "Failed to generate IP for user " << steamID.ConvertToUint64() << std::endl;
         return;
     }
-
-    // 发送IP分配消息
-    sendIPAssignment(steamID, conn, newIP);
 
     // 添加到路由表
     RouteEntry entry;
@@ -415,10 +401,7 @@ void SteamVpnBridge::onUserJoined(CSteamID steamID, HSteamNetConnection conn) {
         routingTable_[newIP] = entry;
     }
 
-    std::cout << "Assigned IP " << ipToString(newIP) << " to " << entry.name << std::endl;
-
-    // 广播路由更新
-    broadcastRouteUpdate();
+    std::cout << "Added route for " << entry.name << " with IP " << ipToString(newIP) << std::endl;
 }
 
 void SteamVpnBridge::onUserLeft(CSteamID steamID) {
@@ -436,12 +419,8 @@ void SteamVpnBridge::onUserLeft(CSteamID steamID) {
     }
 
     if (ipToRemove != 0) {
-        releaseIPAddress(ipToRemove);
-        std::cout << "Released IP " << ipToString(ipToRemove) 
+        std::cout << "Removed route for IP " << ipToString(ipToRemove) 
                   << " from user " << steamID.ConvertToUint64() << std::endl;
-
-        // 广播路由更新
-        broadcastRouteUpdate();
     }
 }
 
@@ -595,4 +574,18 @@ uint32_t SteamVpnBridge::extractSourceIP(const uint8_t* packet, size_t length) {
     uint32_t srcIP;
     memcpy(&srcIP, packet + 12, 4);
     return ntohl(srcIP);
+}
+
+uint32_t SteamVpnBridge::generateIPFromSteamID(CSteamID steamID) {
+    // 使用SteamID的低32位来生成IP地址
+    uint64_t steamID64 = steamID.ConvertToUint64();
+    uint32_t hash = static_cast<uint32_t>(steamID64 ^ (steamID64 >> 32));
+    
+    // 确保IP在子网范围内，并且不是网络地址或广播地址
+    uint32_t maxOffset = (~subnetMask_) - 1;  // 减1避免广播地址
+    uint32_t offset = (hash % maxOffset) + 1;  // 加1避免网络地址
+    
+    uint32_t ip = (baseIP_ & subnetMask_) | offset;
+    
+    return ip;
 }

@@ -14,7 +14,6 @@
 #include <memory>
 #include <fstream>
 #include <filesystem>
-#include "tcp_server.h"
 #include "steam/steam_networking_manager.h"
 #include "steam/steam_room_manager.h"
 #include "steam/steam_utils.h"
@@ -32,11 +31,9 @@
 
 using boost::asio::ip::tcp;
 
-// New variables for multiple connections and TCP clients
+// New variables for multiple connections
 std::vector<HSteamNetConnection> connections;
 std::mutex connectionsMutex; // Add mutex for connections
-int localPort = 0;
-std::unique_ptr<TCPServer> server;
 
 #ifdef _WIN32
 // Windows implementation using mutex and shared memory
@@ -266,14 +263,10 @@ int main()
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
-    // Set message handler dependencies
-    steamManager.setMessageHandlerDependencies(io_context, server, localPort);
+    // Start message handler
     steamManager.startMessageHandler();
 
     // Steam Networking variables
-    bool isHost = false;
-    bool isClient = false;
-    char joinBuffer[256] = "";
     char filterBuffer[256] = "";
     
     // VPN variables
@@ -366,30 +359,22 @@ int main()
         ImGui::Begin("在线游戏工具");
         ImGui::Separator();
 
-        if (!steamManager.isHost() && !steamManager.isConnected())
+        if (!steamManager.isConnected())
         {
-            if (ImGui::Button("主持游戏房间"))
+            if (ImGui::Button("创建房间"))
             {
-                roomManager.startHosting();
+                roomManager.createLobby();
             }
-            ImGui::InputText("房间ID", joinBuffer, IM_ARRAYSIZE(joinBuffer));
-            if (ImGui::Button("加入游戏房间"))
+            ImGui::SameLine();
+            if (ImGui::Button("加入好友房间"))
             {
-                uint64 hostID = std::stoull(joinBuffer);
-                if (steamManager.joinHost(hostID))
-                {
-                    // Start TCP Server
-                    server = std::make_unique<TCPServer>(8888, &steamManager);
-                    if (!server->start())
-                    {
-                        std::cerr << "Failed to start TCP server" << std::endl;
-                    }
-                }
+                // 通过Steam好友列表邀请来加入
+                ImGui::OpenPopup("选择好友房间");
             }
         }
-        if (steamManager.isHost() || steamManager.isConnected())
+        else
         {
-            ImGui::Text(steamManager.isHost() ? "正在主持游戏房间。邀请朋友!" : "已连接到游戏房间。邀请朋友!");
+            ImGui::Text("已连接到房间。邀请朋友!");
             ImGui::Separator();
             
             // VPN Control Section
@@ -444,15 +429,6 @@ int main()
                 
                 roomManager.leaveLobby();
                 steamManager.disconnect();
-                if (server)
-                {
-                    server->stop();
-                    server.reset();
-                }
-            }
-            if (steamManager.isHost())
-            {
-                ImGui::InputInt("本地端口", &localPort);
             }
             ImGui::Separator();
             renderInviteFriends();
@@ -460,8 +436,8 @@ int main()
 
         ImGui::End();
 
-        // Room status window - only show when hosting or connected
-        if ((steamManager.isHost() || steamManager.isConnected()) && roomManager.getCurrentLobby().IsValid())
+        // Room status window - only show when connected
+        if (steamManager.isConnected() && roomManager.getCurrentLobby().IsValid())
         {
             ImGui::Begin("房间状态");
             ImGui::Text("用户列表:");
@@ -565,11 +541,6 @@ int main()
     steamManager.stopMessageHandler();
 
     // Cleanup
-    if (server)
-    {
-        server->stop();
-    }
-
     // Stop io_context and join thread
     work_guard.reset();
     io_context.stop();
