@@ -133,7 +133,7 @@ int main()
     {
         ImGui::InputText("过滤朋友", filterBuffer, IM_ARRAYSIZE(filterBuffer));
         ImGui::Text("朋友:");
-        for (const auto &friendPair : SteamUtils::getFriendsList())
+        for (const auto &friendPair : SteamUtilsHelper::getFriendsList())
         {
             std::string nameStr = friendPair.second;
             std::string filterStr(filterBuffer);
@@ -231,6 +231,22 @@ int main()
                     catch (const std::exception &e)
                     {
                         std::cerr << "Invalid room ID format: " << e.what() << std::endl;
+                    }
+                }
+            }
+
+            
+            ImGui::Separator();
+            ImGui::Text("好友房间:");
+            std::vector<FriendLobbyInfo> friendLobbies = SteamUtilsHelper::getFriendLobbies();
+            if (friendLobbies.empty()) {
+                ImGui::TextDisabled("没有好友在当前游戏中");
+            } else {
+                for (const auto& lobby : friendLobbies) {
+                    std::string label = "加入 " + lobby.friendName + " 的房间";
+                    if (ImGui::Button(label.c_str())) {
+                         roomManager.joinLobby(lobby.lobbyID);
+                         std::cout << "Joining friend lobby: " << lobby.friendName << std::endl;
                     }
                 }
             }

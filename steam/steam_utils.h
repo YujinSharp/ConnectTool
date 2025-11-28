@@ -3,7 +3,13 @@
 #include <string>
 #include <steam_api.h>
 
-class SteamUtils {
+struct FriendLobbyInfo {
+    CSteamID lobbyID;
+    std::string friendName;
+};
+
+class SteamUtilsHelper {
 public:
     static std::vector<std::pair<CSteamID, std::string>> getFriendsList();
+    static std::vector<FriendLobbyInfo> getFriendLobbies();
 };
