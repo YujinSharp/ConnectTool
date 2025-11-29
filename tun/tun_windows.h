@@ -7,9 +7,7 @@
 #include <windows.h>
 #include <guiddef.h>
 
-// 前置声明 Wintun 类型
-typedef struct _WINTUN_ADAPTER *WINTUN_ADAPTER_HANDLE;
-typedef struct _TUN_SESSION *WINTUN_SESSION_HANDLE;
+#include "../third_party/wintun/api/wintun.h"
 
 namespace tun {
 
@@ -51,34 +49,32 @@ private:
     HMODULE wintun_dll_;
     
     // Wintun API 函数指针
-    typedef WINTUN_ADAPTER_HANDLE (WINAPI *WintunCreateAdapterFunc)(LPCWSTR, LPCWSTR, const GUID*);
-    typedef WINTUN_ADAPTER_HANDLE (WINAPI *WintunOpenAdapterFunc)(LPCWSTR);
-    typedef VOID (WINAPI *WintunCloseAdapterFunc)(WINTUN_ADAPTER_HANDLE);
-    typedef BOOL (WINAPI *WintunDeleteAdapterFunc)(WINTUN_ADAPTER_HANDLE, BOOL, BOOL*);
-    typedef WINTUN_SESSION_HANDLE (WINAPI *WintunStartSessionFunc)(WINTUN_ADAPTER_HANDLE, DWORD);
-    typedef VOID (WINAPI *WintunEndSessionFunc)(WINTUN_SESSION_HANDLE);
-    typedef HANDLE (WINAPI *WintunGetReadWaitEventFunc)(WINTUN_SESSION_HANDLE);
-    typedef BYTE* (WINAPI *WintunReceivePacketFunc)(WINTUN_SESSION_HANDLE, DWORD*);
-    typedef VOID (WINAPI *WintunReleaseReceivePacketFunc)(WINTUN_SESSION_HANDLE, const BYTE*);
-    typedef BYTE* (WINAPI *WintunAllocateSendPacketFunc)(WINTUN_SESSION_HANDLE, DWORD);
-    typedef VOID (WINAPI *WintunSendPacketFunc)(WINTUN_SESSION_HANDLE, const BYTE*);
-    typedef VOID (WINAPI *WintunGetAdapterLUIDFunc)(WINTUN_ADAPTER_HANDLE, void*);
+    // Wintun API 函数指针
+    WINTUN_CREATE_ADAPTER_FUNC* WintunCreateAdapter_;
+    WINTUN_OPEN_ADAPTER_FUNC* WintunOpenAdapter_;
+    WINTUN_CLOSE_ADAPTER_FUNC* WintunCloseAdapter_;
     
-    WintunCreateAdapterFunc WintunCreateAdapter_;
-    WintunOpenAdapterFunc WintunOpenAdapter_;
-    WintunCloseAdapterFunc WintunCloseAdapter_;
-    WintunDeleteAdapterFunc WintunDeleteAdapter_;
-    WintunStartSessionFunc WintunStartSession_;
-    WintunEndSessionFunc WintunEndSession_;
-    WintunGetReadWaitEventFunc WintunGetReadWaitEvent_;
-    WintunReceivePacketFunc WintunReceivePacket_;
-    WintunReleaseReceivePacketFunc WintunReleaseReceivePacket_;
-    WintunAllocateSendPacketFunc WintunAllocateSendPacket_;
-    WintunSendPacketFunc WintunSendPacket_;
-    WintunGetAdapterLUIDFunc WintunGetAdapterLUID_;
+    WINTUN_START_SESSION_FUNC* WintunStartSession_;
+    WINTUN_END_SESSION_FUNC* WintunEndSession_;
+    WINTUN_GET_READ_WAIT_EVENT_FUNC* WintunGetReadWaitEvent_;
+    WINTUN_RECEIVE_PACKET_FUNC* WintunReceivePacket_;
+    WINTUN_RELEASE_RECEIVE_PACKET_FUNC* WintunReleaseReceivePacket_;
+    WINTUN_ALLOCATE_SEND_PACKET_FUNC* WintunAllocateSendPacket_;
+    WINTUN_SEND_PACKET_FUNC* WintunSendPacket_;
+    WINTUN_GET_ADAPTER_LUID_FUNC* WintunGetAdapterLUID_;
+    WINTUN_SET_LOGGER_FUNC* WintunSetLogger_;
+
+    static void CALLBACK wintun_logger_callback(WINTUN_LOGGER_LEVEL Level, DWORD64 Timestamp, LPCWSTR Message);
     
     bool load_wintun_dll();
     void unload_wintun_dll();
+
+    // 辅助模板：加载 DLL 函数并自动转换类型
+    template<typename T>
+    T load_func(const char* func_name) {
+        return reinterpret_cast<T>(GetProcAddress(wintun_dll_, func_name));
+    }
+
     std::wstring string_to_wstring(const std::string& str);
     std::string get_windows_error(DWORD error_code);
 };

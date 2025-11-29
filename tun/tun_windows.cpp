@@ -17,8 +17,7 @@
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
-#define WINTUN_MIN_RING_CAPACITY 0x20000  // 128 KiB
-#define WINTUN_MAX_RING_CAPACITY 0x4000000  // 64 MiB
+
 
 namespace tun {
 
@@ -32,7 +31,6 @@ TunWindows::TunWindows()
     , WintunCreateAdapter_(nullptr)
     , WintunOpenAdapter_(nullptr)
     , WintunCloseAdapter_(nullptr)
-    , WintunDeleteAdapter_(nullptr)
     , WintunStartSession_(nullptr)
     , WintunEndSession_(nullptr)
     , WintunGetReadWaitEvent_(nullptr)
@@ -40,7 +38,8 @@ TunWindows::TunWindows()
     , WintunReleaseReceivePacket_(nullptr)
     , WintunAllocateSendPacket_(nullptr)
     , WintunSendPacket_(nullptr)
-    , WintunGetAdapterLUID_(nullptr) {
+    , WintunGetAdapterLUID_(nullptr)
+    , WintunSetLogger_(nullptr) {
     memset(&adapter_guid_, 0, sizeof(adapter_guid_));
 }
 
@@ -68,6 +67,25 @@ std::string TunWindows::get_windows_error(DWORD error_code) {
     return message;
 }
 
+void CALLBACK TunWindows::wintun_logger_callback(WINTUN_LOGGER_LEVEL Level, DWORD64 Timestamp, LPCWSTR Message) {
+    const char* levelStr = "[INFO]";
+    switch (Level) {
+        case WINTUN_LOG_INFO: levelStr = "[INFO]"; break;
+        case WINTUN_LOG_WARN: levelStr = "[WARN]"; break;
+        case WINTUN_LOG_ERR: levelStr = "[ERROR]"; break;
+    }
+    
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, Message, -1, NULL, 0, NULL, NULL);
+    std::string message(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, Message, -1, &message[0], size_needed, NULL, NULL);
+    
+    if (!message.empty() && message.back() == '\0') {
+        message.pop_back();
+    }
+
+    std::cout << "Wintun " << levelStr << ": " << message << std::endl;
+}
+
 bool TunWindows::load_wintun_dll() {
     // 尝试从多个位置加载 wintun.dll
     const char* dll_paths[] = {
@@ -93,18 +111,23 @@ bool TunWindows::load_wintun_dll() {
     }
     
     // 加载所有 Wintun API 函数
-    WintunCreateAdapter_ = (WintunCreateAdapterFunc)GetProcAddress(wintun_dll_, "WintunCreateAdapter");
-    WintunOpenAdapter_ = (WintunOpenAdapterFunc)GetProcAddress(wintun_dll_, "WintunOpenAdapter");
-    WintunCloseAdapter_ = (WintunCloseAdapterFunc)GetProcAddress(wintun_dll_, "WintunCloseAdapter");
-    WintunDeleteAdapter_ = (WintunDeleteAdapterFunc)GetProcAddress(wintun_dll_, "WintunDeleteAdapter");
-    WintunStartSession_ = (WintunStartSessionFunc)GetProcAddress(wintun_dll_, "WintunStartSession");
-    WintunEndSession_ = (WintunEndSessionFunc)GetProcAddress(wintun_dll_, "WintunEndSession");
-    WintunGetReadWaitEvent_ = (WintunGetReadWaitEventFunc)GetProcAddress(wintun_dll_, "WintunGetReadWaitEvent");
-    WintunReceivePacket_ = (WintunReceivePacketFunc)GetProcAddress(wintun_dll_, "WintunReceivePacket");
-    WintunReleaseReceivePacket_ = (WintunReleaseReceivePacketFunc)GetProcAddress(wintun_dll_, "WintunReleaseReceivePacket");
-    WintunAllocateSendPacket_ = (WintunAllocateSendPacketFunc)GetProcAddress(wintun_dll_, "WintunAllocateSendPacket");
-    WintunSendPacket_ = (WintunSendPacketFunc)GetProcAddress(wintun_dll_, "WintunSendPacket");
-    WintunGetAdapterLUID_ = (WintunGetAdapterLUIDFunc)GetProcAddress(wintun_dll_, "WintunGetAdapterLUID");
+    WintunCreateAdapter_ = load_func<WINTUN_CREATE_ADAPTER_FUNC*>("WintunCreateAdapter");
+    WintunOpenAdapter_ = load_func<WINTUN_OPEN_ADAPTER_FUNC*>("WintunOpenAdapter");
+    WintunCloseAdapter_ = load_func<WINTUN_CLOSE_ADAPTER_FUNC*>("WintunCloseAdapter");
+    WintunStartSession_ = load_func<WINTUN_START_SESSION_FUNC*>("WintunStartSession");
+    WintunEndSession_ = load_func<WINTUN_END_SESSION_FUNC*>("WintunEndSession");
+    WintunGetReadWaitEvent_ = load_func<WINTUN_GET_READ_WAIT_EVENT_FUNC*>("WintunGetReadWaitEvent");
+    WintunReceivePacket_ = load_func<WINTUN_RECEIVE_PACKET_FUNC*>("WintunReceivePacket");
+    WintunReleaseReceivePacket_ = load_func<WINTUN_RELEASE_RECEIVE_PACKET_FUNC*>("WintunReleaseReceivePacket");
+    WintunAllocateSendPacket_ = load_func<WINTUN_ALLOCATE_SEND_PACKET_FUNC*>("WintunAllocateSendPacket");
+    WintunSendPacket_ = load_func<WINTUN_SEND_PACKET_FUNC*>("WintunSendPacket");
+    WintunGetAdapterLUID_ = load_func<WINTUN_GET_ADAPTER_LUID_FUNC*>("WintunGetAdapterLUID");
+    WintunSetLogger_ = load_func<WINTUN_SET_LOGGER_FUNC*>("WintunSetLogger");
+
+    if (WintunSetLogger_) {
+        WintunSetLogger_(wintun_logger_callback);
+        std::cout << "TunWindows: Wintun logger registered." << std::endl;
+    }
     
     if (!WintunCreateAdapter_ || !WintunCloseAdapter_ || !WintunStartSession_ || 
         !WintunEndSession_ || !WintunGetReadWaitEvent_ || !WintunReceivePacket_ ||
@@ -128,7 +151,6 @@ void TunWindows::unload_wintun_dll() {
     WintunCreateAdapter_ = nullptr;
     WintunOpenAdapter_ = nullptr;
     WintunCloseAdapter_ = nullptr;
-    WintunDeleteAdapter_ = nullptr;
     WintunStartSession_ = nullptr;
     WintunEndSession_ = nullptr;
     WintunGetReadWaitEvent_ = nullptr;
@@ -137,6 +159,7 @@ void TunWindows::unload_wintun_dll() {
     WintunAllocateSendPacket_ = nullptr;
     WintunSendPacket_ = nullptr;
     WintunGetAdapterLUID_ = nullptr;
+    WintunSetLogger_ = nullptr;
 }
 
 bool TunWindows::open(const std::string& device_name, uint32_t mtu) {
@@ -223,24 +246,7 @@ void TunWindows::close() {
     }
     
     if (adapter_) {
-        bool deleted = false;
-        // 如果有 DeleteAdapter 函数，尝试删除适配器
-        if (WintunDeleteAdapter_) {
-             BOOL rebootRequired = FALSE;
-             // 删除适配器。这也会关闭适配器句柄。
-             std::cout << "TunWindows: Deleting adapter..." << std::endl;
-             if (WintunDeleteAdapter_(adapter_, FALSE, &rebootRequired)) {
-                 std::cout << "TunWindows: Adapter deleted successfully." << std::endl;
-                 deleted = true;
-             } else {
-                 std::cerr << "TunWindows: Failed to delete adapter." << std::endl;
-             }
-        }
-        
-        // 如果删除失败（或者没有 Delete 函数），则常规关闭
-        if (!deleted) {
-            WintunCloseAdapter_(adapter_);
-        }
+        WintunCloseAdapter_(adapter_);
         adapter_ = nullptr;
     }
     
@@ -366,7 +372,7 @@ int TunWindows::read(uint8_t* buffer, size_t max_length) {
     BYTE* packet = WintunReceivePacket_(session_, &packet_size);
     
     if (packet) {
-        // std::cout << "TunWindows: Received packet of size " << packet_size << std::endl;
+        std::cout << "TunWindows: Read packet size: " << packet_size << std::endl;
     }
     
     if (!packet) {
@@ -418,7 +424,7 @@ int TunWindows::write(const uint8_t* buffer, size_t length) {
         return -1;
     }
 
-    if (length > 0xFFFF) {  // WINTUN_MAX_IP_PACKET_SIZE
+    if (length > WINTUN_MAX_IP_PACKET_SIZE) {
         last_error_ = "Packet too large";
         std::cerr << "TunWindows Error: " << last_error_ << std::endl;
         return -1;
@@ -449,7 +455,7 @@ int TunWindows::write(const uint8_t* buffer, size_t length) {
     memcpy(packet, buffer, length);
     
     // 发送数据包
-    // std::cout << "TunWindows: Sending packet of size " << length << std::endl;
+    std::cout << "TunWindows: Writing packet size: " << length << std::endl;
     WintunSendPacket_(session_, packet);
     
     return static_cast<int>(length);

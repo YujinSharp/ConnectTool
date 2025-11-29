@@ -2,6 +2,7 @@
 #include "steam_networking_manager.h"
 #include <iostream>
 #include <cstring>
+#include <sstream> // 新增: 用于构建命令字符串
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -12,6 +13,7 @@
 #include <set>
 #include <chrono>
 #include <cstdlib>
+#include <thread>
 
 SteamVpnBridge::SteamVpnBridge(SteamNetworkingManager* steamManager)
     : steamManager_(steamManager)
@@ -21,6 +23,7 @@ SteamVpnBridge::SteamVpnBridge(SteamNetworkingManager* steamManager)
     , nextIP_(0)
     , negotiationState_(IpNegotiationState::IDLE)
     , candidateIP_(0)
+    , localIP_(0) // 初始化
 {
     memset(&stats_, 0, sizeof(stats_));
 }
@@ -45,12 +48,15 @@ bool SteamVpnBridge::start(const std::string& tunDeviceName,
     }
 
     // 打开TUN设备
-    if (!tunDevice_->open(tunDeviceName, 1400)) { // MTU设置为1400以留出Steam封装开销
+    // MTU 1400 是个安全值，Steam P2P 也就是 ~1200-1300 字节的有效载荷
+    if (!tunDevice_->open(tunDeviceName, 1400)) { 
         std::cerr << "Failed to open TUN device: " << tunDevice_->get_last_error() << std::endl;
         return false;
     }
 
     std::cout << "TUN device created: " << tunDevice_->get_device_name() << std::endl;
+    std::cout << "IMPORTANT: Pinging your own IP (Self) will NOT generate packets in the TUN device." << std::endl;
+    std::cout << "Please ping other IPs in the subnet to test connectivity." << std::endl;
 
     // 初始化IP地址池
     baseIP_ = stringToIp(virtualSubnet);
@@ -59,7 +65,7 @@ bool SteamVpnBridge::start(const std::string& tunDeviceName,
         return false;
     }
     subnetMask_ = stringToIp(subnetMask);
-    nextIP_ = baseIP_ + 1;  // .0 通常保留给网络地址
+    nextIP_ = baseIP_ + 1; 
 
     // 开始IP协商流程
     startIpNegotiation();
@@ -142,85 +148,42 @@ void SteamVpnBridge::tunReadThread() {
         int bytesRead = tunDevice_->read(buffer, sizeof(buffer));
         
         if (bytesRead > 0) {
+            // [DEBUG] 只要收到包就打印，这样即使路由表没命中，你也能知道网卡配置是对的
+            // 注意：不要在生产环境大量打印，会刷屏
+            // std::cout << "TUN RX: " << bytesRead << " bytes. ";
+
             // 提取目标IP
             uint32_t destIP = extractDestIP(buffer, bytesRead);
-            uint32_t srcIP = extractSourceIP(buffer, bytesRead);
-
-            // 防止回环：只允许源IP为本机IP（或0.0.0.0）的包发出
-            // 如果读取到的包的源IP不是我自己，说明是收到的包被回传了（或者OS在转发），需要丢弃
-            if (localIP_ != 0 && srcIP != localIP_ && srcIP != 0) {
-                // 可以在这里加个日志观察频率，但为了性能暂时注释
-                std::cout << "TUN read thread: Dropping loopback packet. Src: " << ipToString(srcIP) << ", My: " << ipToString(localIP_) << std::endl;
-                continue;
-            }
+            // uint32_t srcIP = extractSourceIP(buffer, bytesRead);
             
-            if (destIP == 0) {
-                // 无效的IP包
-                std::cerr << "TUN read thread: Dropping invalid IP packet. Length: " << bytesRead << std::endl;
-                if (bytesRead >= 4) {
-                    std::cerr << "First 4 bytes: " 
-                              << std::hex << (int)buffer[0] << " " 
-                              << (int)buffer[1] << " " 
-                              << (int)buffer[2] << " " 
-                              << (int)buffer[3] << std::dec << std::endl;
-                }
-                std::lock_guard<std::mutex> lock(statsMutex_);
-                stats_.packetsDropped++;
-                continue;
-            }
-            // 检查协议类型 (IPv4 header offset 9)
-            uint8_t protocol = buffer[9];
-            if (protocol == 1) { // ICMP
-                // ICMP header starts after IP header (assuming 20 bytes for now, strictly should check IHL)
-                // IHL is lower 4 bits of first byte, times 4
-                int ihl = (buffer[0] & 0x0F) * 4;
-                if (bytesRead >= ihl + 2) {
-                    uint8_t icmpType = buffer[ihl];
-                    uint8_t icmpCode = buffer[ihl + 1];
-                    std::cout << "TUN read thread: ICMP Packet. Type: " << (int)icmpType 
-                              << " (8=Ping, 0=Pong), Code: " << (int)icmpCode 
-                              << ", Src: " << ipToString(srcIP) 
-                              << ", Dst: " << ipToString(destIP) << std::endl;
-                }
-            }
-
-            std::cout << "TUN read thread: Extracted destination IP: " << ipToString(destIP) << std::endl;
+            // std::cout << "Dst: " << ipToString(destIP) << std::endl;
 
             // 查找路由
             HSteamNetConnection targetConn = k_HSteamNetConnection_Invalid;
             std::vector<HSteamNetConnection> broadcastConns;
 
-            std::lock_guard<std::mutex> lock(routingMutex_);
-            auto it = routingTable_.find(destIP);
-            if (it != routingTable_.end()) {
-                if (!it->second.isLocal) {
+            bool routeFound = false;
+            {
+                std::lock_guard<std::mutex> lock(routingMutex_);
+                auto it = routingTable_.find(destIP);
+                if (it != routingTable_.end()) {
                     targetConn = it->second.conn;
-                    std::cout << "TUN read thread: Found route for " << ipToString(destIP) << ", target connection: " << it->second.steamID.ConvertToUint64() << std::endl;
-                } else {
-                    // 发送给本地，忽略
-                    std::cout << "TUN read thread: Packet for local IP " << ipToString(destIP) << ", ignoring." << std::endl;
-                    continue;
-                }
-            } 
-            // else {
-            //     // 如果是广播或未知目标，发送给所有连接
-            //     std::cout << "TUN read thread: No route found for destination IP: " << ipToString(destIP) << ", broadcasting to all peers." << std::endl;
-                
-            //     std::set<HSteamNetConnection> uniqueConns;
-            //     for (const auto& entry : routingTable_) {
-            //         if (!entry.second.isLocal && entry.second.conn != k_HSteamNetConnection_Invalid) {
-            //             uniqueConns.insert(entry.second.conn);
-            //         }
-            //     }
-            //     broadcastConns.assign(uniqueConns.begin(), uniqueConns.end());
-            // }
+                    routeFound = true;
+                } 
+            }
 
-            if (targetConn != k_HSteamNetConnection_Invalid || !broadcastConns.empty()) {
+            // 如果没找到特定路由，但目标IP在我们的子网内，可以选择广播或者丢弃
+            // 这里为了演示 Ping 测试，如果未找到路由，我们仅打印Log，不发送（或者你可以选择广播）
+            if (!routeFound) {
+                 // std::cout << "No route for " << ipToString(destIP) << " (ignoring)" << std::endl;
+            }
+
+            if (targetConn != k_HSteamNetConnection_Invalid) {
                 // 封装VPN消息
                 std::vector<uint8_t> vpnPacket;
                 VpnMessageHeader header;
                 header.type = VpnMessageType::IP_PACKET;
-                header.length = htons(bytesRead);
+                header.length = htons(static_cast<uint16_t>(bytesRead)); // 修正类型转换警告
                 
                 vpnPacket.resize(sizeof(VpnMessageHeader) + bytesRead);
                 memcpy(vpnPacket.data(), &header, sizeof(VpnMessageHeader));
@@ -229,55 +192,29 @@ void SteamVpnBridge::tunReadThread() {
                 // 通过Steam发送
                 ISteamNetworkingSockets* steamInterface = steamManager_->getInterface();
                 
-                if (targetConn != k_HSteamNetConnection_Invalid) {
-                    EResult result = steamInterface->SendMessageToConnection(
-                        targetConn,
-                        vpnPacket.data(),
-                        vpnPacket.size(),
-                        k_nSteamNetworkingSend_Reliable,
-                        nullptr
-                    );
+                // 单播发送
+                EResult result = steamInterface->SendMessageToConnection(
+                    targetConn,
+                    vpnPacket.data(),
+                    static_cast<uint32_t>(vpnPacket.size()),
+                    k_nSteamNetworkingSend_Reliable, // VPN流量通常用Unreliable可能更好，但为了防止丢包先用Reliable
+                    nullptr
+                );
 
-                    if (result == k_EResultOK) {
-                        std::cout << "TUN read thread: Successfully sent " << vpnPacket.size() << " bytes to Steam connection " << targetConn << std::endl;
-                        std::lock_guard<std::mutex> lock(statsMutex_);
-                        stats_.packetsSent++;
-                        stats_.bytesSent += bytesRead;
-                    } else {
-                        std::cerr << "TUN read thread: Failed to send packet to Steam connection " << targetConn << ", result: " << result << std::endl;
-                        std::lock_guard<std::mutex> lock(statsMutex_);
-                        stats_.packetsDropped++;
-                    }
+                std::lock_guard<std::mutex> lock(statsMutex_);
+                if (result == k_EResultOK) {
+                    stats_.packetsSent++;
+                    stats_.bytesSent += bytesRead;
                 } else {
-                    // 广播发送
-                    int sentCount = 0;
-                    for (auto conn : broadcastConns) {
-                        EResult result = steamInterface->SendMessageToConnection(
-                            conn,
-                            vpnPacket.data(),
-                            vpnPacket.size(),
-                            k_nSteamNetworkingSend_Reliable,
-                            nullptr
-                        );
-                        if (result == k_EResultOK) {
-                            sentCount++;
-                        }
-                    }
-                    
-                    if (sentCount > 0) {
-                        std::cout << "TUN read thread: Broadcasted packet to " << sentCount << " peers." << std::endl;
-                        std::lock_guard<std::mutex> lock(statsMutex_);
-                        stats_.packetsSent += sentCount;
-                        stats_.bytesSent += bytesRead * sentCount;
-                    }
+                    stats_.packetsDropped++;
                 }
             }
         } else if (bytesRead < 0) {
-            // 读取错误，等待一下再试
-            std::cerr << "TUN read thread: Error reading from TUN device, bytesRead=" << bytesRead << ". Retrying soon." << std::endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // 在某些实现中，read返回-1且errno为EAGAIN表示无数据
+            // 这里简单休眠
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } else {
-            // 没有数据，等待一下
+            // bytesRead == 0
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
@@ -294,29 +231,33 @@ void SteamVpnBridge::tunWriteThread() {
     while (running_) {
         std::vector<OutgoingPacket> packetsToSend;
         
-        std::lock_guard<std::mutex> lock(sendQueueMutex_);
-        if (!sendQueue_.empty()) {
-            packetsToSend = std::move(sendQueue_);
-            sendQueue_.clear();
+        {
+            std::lock_guard<std::mutex> lock(sendQueueMutex_);
+            if (!sendQueue_.empty()) {
+                packetsToSend = std::move(sendQueue_);
+                sendQueue_.clear();
+            }
         }
         
         for (const auto& packet : packetsToSend) {
             // 写入TUN设备
+            // 注意：Wintun 是 Layer 3 接口，直接写入 IP 包即可
             int bytesWritten = tunDevice_->write(packet.data.data(), packet.data.size());
             
+            std::lock_guard<std::mutex> lock(statsMutex_);
             if (bytesWritten > 0) {
-                std::lock_guard<std::mutex> lock(statsMutex_);
                 stats_.packetsReceived++;
                 stats_.bytesReceived += bytesWritten;
-                std::cout << "TUN write thread: Wrote " << bytesWritten << " bytes to TUN device." << std::endl;
             } else {
-                std::lock_guard<std::mutex> lock(statsMutex_);
                 stats_.packetsDropped++;
-                std::cerr << "TUN write thread: Failed to write packet to TUN device, bytesWritten=" << bytesWritten << std::endl;
+                // std::cerr << "TUN Write Error" << std::endl;
             }
         }
         
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // 如果没有包发送，休眠一小会儿避免空转
+        if (packetsToSend.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
     
     std::cout << "TUN write thread stopped" << std::endl;
@@ -340,7 +281,7 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
     switch (header.type) {
         case VpnMessageType::IP_PACKET: {
             // 将IP包写入TUN设备
-            std::cout << "Received IP packet from Steam connection " << fromConn << ", length: " << payloadLength << std::endl;
+            // [Debug] std::cout << "RX IP Packet from Conn " << fromConn << " Len: " << payloadLength << std::endl;
             
             OutgoingPacket packet;
             packet.data.resize(payloadLength);
@@ -351,8 +292,6 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
             sendQueue_.push_back(std::move(packet));
             break;
         }
-
-
 
         case VpnMessageType::ROUTE_UPDATE: {
             // 路由表更新
@@ -382,11 +321,7 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
                 }
 
                 if (conn != k_HSteamNetConnection_Invalid) {
-                    // Validate IP against our subnet
                     if ((ipAddress & subnetMask_) != (baseIP_ & subnetMask_)) {
-                        std::cerr << "Ignoring route update for IP " << ipToString(ipAddress) 
-                                  << " (SteamID " << csteamID.ConvertToUint64() << ")"
-                                  << " because it does not match our subnet." << std::endl;
                         continue;
                     }
 
@@ -399,10 +334,10 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
 
                     std::lock_guard<std::mutex> lock(routingMutex_);
                     routingTable_[ipAddress] = entry;
-                    updateSystemRoute(ipAddress, true);
+                    
                     anyUpdate = true;
                     
-                    std::cout << "Route updated: " << ipToString(ipAddress) 
+                    std::cout << "Route learned: " << ipToString(ipAddress) 
                               << " -> " << entry.name << std::endl;
                 }
             }
@@ -412,11 +347,6 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
             break;
         }
 
-        case VpnMessageType::PING:
-        case VpnMessageType::PONG:
-            // 心跳包处理（暂时忽略）
-            break;
-
         case VpnMessageType::IP_PROBE:
             handleIpProbe(payload, payloadLength, fromConn);
             break;
@@ -424,24 +354,24 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
         case VpnMessageType::IP_CONFLICT:
             handleIpConflict(payload, payloadLength, fromConn);
             break;
+            
+        default:
+            break;
     }
 }
 
 void SteamVpnBridge::onUserJoined(CSteamID steamID, HSteamNetConnection conn) {
-    std::cout << "User joined: " << steamID.ConvertToUint64() << ". Negotiating IP..." << std::endl;
+    std::cout << "User joined: " << steamID.ConvertToUint64() << ". Calculating IP..." << std::endl;
 
-    // 1. Calculate deterministic IP
     uint32_t seedIP = generateIPFromSteamID(steamID);
     uint32_t ip = findNextAvailableIP(seedIP);
 
-    // 2. Add to routing table immediately (Optimistic)
     {
         std::lock_guard<std::mutex> lock(routingMutex_);
         
-        // Remove any existing entries for this SteamID to avoid duplicates
+        // Remove existing
         for (auto it = routingTable_.begin(); it != routingTable_.end(); ) {
             if (it->second.steamID == steamID) {
-                updateSystemRoute(it->first, false);
                 it = routingTable_.erase(it);
             } else {
                 ++it;
@@ -455,17 +385,14 @@ void SteamVpnBridge::onUserJoined(CSteamID steamID, HSteamNetConnection conn) {
         entry.name = SteamFriends()->GetFriendPersonaName(steamID);
         entry.isLocal = false;
         routingTable_[ip] = entry;
-        updateSystemRoute(ip, true);
     }
-    std::cout << "Optimistically assigned IP " << ipToString(ip) << " to user " << steamID.ConvertToUint64() << std::endl;
+    std::cout << "Assigned IP " << ipToString(ip) << " to user " << steamID.ConvertToUint64() << std::endl;
     printRoutingTable();
 
-    // 3. Broadcast route update
     broadcastRouteUpdate();
 }
 
 void SteamVpnBridge::onUserLeft(CSteamID steamID) {
-    // 从路由表中移除
     uint32_t ipToRemove = 0;
     {
         std::lock_guard<std::mutex> lock(routingMutex_);
@@ -477,13 +404,6 @@ void SteamVpnBridge::onUserLeft(CSteamID steamID) {
             }
         }
     }
-
-    if (ipToRemove != 0) {
-        updateSystemRoute(ipToRemove, false);
-        std::cout << "Removed route for IP " << ipToString(ipToRemove) 
-                  << " from user " << steamID.ConvertToUint64() << std::endl;
-        printRoutingTable();
-    }
 }
 
 SteamVpnBridge::Statistics SteamVpnBridge::getStatistics() const {
@@ -491,10 +411,7 @@ SteamVpnBridge::Statistics SteamVpnBridge::getStatistics() const {
     return stats_;
 }
 
-
-
 void SteamVpnBridge::broadcastRouteUpdate() {
-    // 构建路由更新消息
     std::vector<uint8_t> message;
     std::vector<uint8_t> routeData;
 
@@ -513,13 +430,12 @@ void SteamVpnBridge::broadcastRouteUpdate() {
 
     VpnMessageHeader header;
     header.type = VpnMessageType::ROUTE_UPDATE;
-    header.length = htons(routeData.size());
+    header.length = htons(static_cast<uint16_t>(routeData.size()));
 
     message.resize(sizeof(VpnMessageHeader) + routeData.size());
     memcpy(message.data(), &header, sizeof(VpnMessageHeader));
     memcpy(message.data() + sizeof(VpnMessageHeader), routeData.data(), routeData.size());
 
-    // 发送给所有连接
     ISteamNetworkingSockets* steamInterface = steamManager_->getInterface();
     const auto& connections = steamManager_->getConnections();
     
@@ -527,7 +443,7 @@ void SteamVpnBridge::broadcastRouteUpdate() {
         steamInterface->SendMessageToConnection(
             conn,
             message.data(),
-            message.size(),
+            static_cast<uint32_t>(message.size()),
             k_nSteamNetworkingSend_Reliable,
             nullptr
         );
@@ -547,57 +463,39 @@ uint32_t SteamVpnBridge::stringToIp(const std::string& ipStr) {
     if (inet_pton(AF_INET, ipStr.c_str(), &addr) == 1) {
         return ntohl(addr.s_addr);
     }
-    std::cerr << "Failed to convert IP string '" << ipStr << "' to integer. Error: " << errno << std::endl;
     return 0;
 }
 
 uint32_t SteamVpnBridge::extractDestIP(const uint8_t* packet, size_t length) {
-    // IPv4包头最小20字节
-    if (length < 20) {
-        return 0;
-    }
-
+    if (length < 20) return 0;
     // 检查IP版本
     uint8_t version = (packet[0] >> 4) & 0x0F;
-    if (version != 4) {
-        return 0;  // 只支持IPv4
-    }
+    if (version != 4) return 0;
 
-    // 目标IP在偏移16-19字节
     uint32_t destIP;
     memcpy(&destIP, packet + 16, 4);
     return ntohl(destIP);
 }
 
 uint32_t SteamVpnBridge::extractSourceIP(const uint8_t* packet, size_t length) {
-    // IPv4包头最小20字节
-    if (length < 20) {
-        return 0;
-    }
-
-    // 检查IP版本
+    if (length < 20) return 0;
     uint8_t version = (packet[0] >> 4) & 0x0F;
-    if (version != 4) {
-        return 0;  // 只支持IPv4
-    }
+    if (version != 4) return 0;
 
-    // 源IP在偏移12-15字节
     uint32_t srcIP;
     memcpy(&srcIP, packet + 12, 4);
     return ntohl(srcIP);
 }
 
 uint32_t SteamVpnBridge::generateIPFromSteamID(CSteamID steamID) {
-    // 使用SteamID的低32位来生成IP地址
     uint64_t steamID64 = steamID.ConvertToUint64();
     uint32_t hash = static_cast<uint32_t>(steamID64 ^ (steamID64 >> 32));
     
-    // 确保IP在子网范围内，并且不是网络地址或广播地址
-    uint32_t maxOffset = (~subnetMask_) - 1;  // 减1避免广播地址
-    uint32_t offset = (hash % maxOffset) + 1;  // 加1避免网络地址
+    // 避免 .0 (Network) 和 .255 (Broadcast)
+    uint32_t maxOffset = (~subnetMask_) - 1; 
+    uint32_t offset = (hash % maxOffset) + 1;
     
     uint32_t ip = (baseIP_ & subnetMask_) | offset;
-    
     return ip;
 }
 
@@ -607,12 +505,9 @@ void SteamVpnBridge::startIpNegotiation() {
     CSteamID mySteamID = SteamUser()->GetSteamID();
     uint32_t seedIP;
     
-    // 1. 确定起始偏移量
     if (negotiationState_ == IpNegotiationState::IDLE || candidateIP_ == 0) {
-        // 第一次协商，从Hash开始
         seedIP = generateIPFromSteamID(mySteamID);
     } else {
-        // 重试，从当前+1开始
         uint32_t currentOffset = candidateIP_ & ~subnetMask_;
         uint32_t nextOffset = currentOffset + 1;
         if (nextOffset > 253) nextOffset = 1;
@@ -620,14 +515,11 @@ void SteamVpnBridge::startIpNegotiation() {
     }
     
     negotiationState_ = IpNegotiationState::NEGOTIATING;
-    
-    // 2. 计算候选IP（本地冲突检测）
     candidateIP_ = findNextAvailableIP(seedIP);
     
-    std::cout << "Starting IP negotiation. Candidate IP: " << ipToString(candidateIP_) << std::endl;
+    std::cout << "Negotiating IP: " << ipToString(candidateIP_) << std::endl;
     
-    // 4. 广播探测包
-    // Payload: { Target_IP (4 bytes), My_SteamID (8 bytes) }
+    // 构建探测包
     std::vector<uint8_t> payload(12);
     uint32_t ipNet = htonl(candidateIP_);
     uint64_t sid = mySteamID.ConvertToUint64();
@@ -637,17 +529,16 @@ void SteamVpnBridge::startIpNegotiation() {
     std::vector<uint8_t> message;
     VpnMessageHeader header;
     header.type = VpnMessageType::IP_PROBE;
-    header.length = htons(payload.size());
+    header.length = htons(static_cast<uint16_t>(payload.size()));
     
     message.resize(sizeof(VpnMessageHeader) + payload.size());
     memcpy(message.data(), &header, sizeof(VpnMessageHeader));
     memcpy(message.data() + sizeof(VpnMessageHeader), payload.data(), payload.size());
     
-    // 广播
     ISteamNetworkingSockets* steamInterface = steamManager_->getInterface();
     const auto& connections = steamManager_->getConnections();
     for (auto conn : connections) {
-        steamInterface->SendMessageToConnection(conn, message.data(), message.size(), k_nSteamNetworkingSend_Reliable, nullptr);
+        steamInterface->SendMessageToConnection(conn, message.data(), static_cast<uint32_t>(message.size()), k_nSteamNetworkingSend_Reliable, nullptr);
     }
     
     probeStartTime_ = std::chrono::steady_clock::now();
@@ -659,17 +550,22 @@ void SteamVpnBridge::checkIpNegotiationTimeout() {
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - probeStartTime_).count();
     
-    if (elapsed > 300) { // 300ms 等待窗口
-        std::cout << "IP negotiation success. Assigned IP: " << ipToString(candidateIP_) << std::endl;
+    // 300ms 等待窗口
+    if (elapsed > 300) { 
+        std::cout << "IP negotiation success. Local IP: " << ipToString(candidateIP_) << std::endl;
         
         negotiationState_ = IpNegotiationState::STABLE;
         localIP_ = candidateIP_;
         
         // 配置TUN设备
         std::string localIPStr = ipToString(localIP_);
+        std::string subnetMaskStr = ipToString(subnetMask_); 
         
-        if (tunDevice_->set_ip(localIPStr, "255.255.255.255") && tunDevice_->set_up()) {
-             // 添加本地路由
+        // 【关键修改】不要使用 255.255.255.255 作为掩码，否则Windows不知道该网卡属于哪个网段
+        // 使用实际的子网掩码（例如 255.255.255.0），这样当你 ping 网段内其他不存在的IP时，
+        // 流量也会被路由到 TUN 设备，方便你在 tunReadThread 中进行测试。
+        if (tunDevice_->set_ip(localIPStr, subnetMaskStr) && tunDevice_->set_up()) {
+            
             RouteEntry localRoute;
             localRoute.steamID = SteamUser()->GetSteamID();
             localRoute.conn = k_HSteamNetConnection_Invalid;
@@ -680,22 +576,11 @@ void SteamVpnBridge::checkIpNegotiationTimeout() {
             {
                 std::lock_guard<std::mutex> lock(routingMutex_);
                 routingTable_[localIP_] = localRoute;
-                
-                // 刷新所有非本地路由的系统路由表
-                // 这是为了确保在网卡IP配置好后，所有Peer的路由都正确添加，且网关正确
-                std::cout << "Refreshing system routes for all peers..." << std::endl;
-                for (const auto& entry : routingTable_) {
-                    if (!entry.second.isLocal) {
-                        updateSystemRoute(entry.second.ipAddress, true);
-                    }
-                }
             }
             
-            // 广播路由更新，让别人知道我占用了这个IP
             broadcastRouteUpdate();
-            printRoutingTable();
         } else {
-             std::cerr << "Failed to configure TUN device with negotiated IP." << std::endl;
+             std::cerr << "Failed to configure TUN device IP." << std::endl;
         }
     }
 }
@@ -709,7 +594,6 @@ void SteamVpnBridge::handleIpProbe(const uint8_t* data, size_t length, HSteamNet
     memcpy(&peerSteamIDVal, data + 4, 8);
     targetIP = ntohl(targetIP);
     
-    // 检查是否冲突
     bool conflict = false;
     
     if (negotiationState_ == IpNegotiationState::STABLE) {
@@ -718,25 +602,17 @@ void SteamVpnBridge::handleIpProbe(const uint8_t* data, size_t length, HSteamNet
         }
     } else if (negotiationState_ == IpNegotiationState::NEGOTIATING) {
         if (targetIP == candidateIP_) {
-            // 同时探测，进行仲裁
             CSteamID mySteamID = SteamUser()->GetSteamID();
             if (mySteamID.ConvertToUint64() > peerSteamIDVal) {
-                // 我赢了，忽略对方请求
-                std::cout << "IP Probe collision for " << ipToString(targetIP) << ". I win (MyID > PeerID). Ignoring peer." << std::endl;
-                return; 
+                return; // 我赢了
             } else {
-                // 我输了，放弃当前IP，重新协商
-                std::cout << "IP Probe collision for " << ipToString(targetIP) << ". I lose (MyID < PeerID). Retrying." << std::endl;
-                startIpNegotiation(); // 这会重新计算并广播
+                startIpNegotiation(); // 我输了，重试
                 return;
             }
         }
     }
     
     if (conflict) {
-        std::cout << "Received IP Probe for my IP " << ipToString(targetIP) << " from " << peerSteamIDVal << ". Sending Conflict." << std::endl;
-        
-        // 发送冲突响应
         std::vector<uint8_t> payload(4);
         uint32_t ipNet = htonl(targetIP);
         memcpy(payload.data(), &ipNet, 4);
@@ -744,45 +620,32 @@ void SteamVpnBridge::handleIpProbe(const uint8_t* data, size_t length, HSteamNet
         std::vector<uint8_t> message;
         VpnMessageHeader header;
         header.type = VpnMessageType::IP_CONFLICT;
-        header.length = htons(payload.size());
+        header.length = htons(static_cast<uint16_t>(payload.size()));
         
         message.resize(sizeof(VpnMessageHeader) + payload.size());
         memcpy(message.data(), &header, sizeof(VpnMessageHeader));
         memcpy(message.data() + sizeof(VpnMessageHeader), payload.data(), payload.size());
         
-        ISteamNetworkingSockets* steamInterface = steamManager_->getInterface();
-        steamInterface->SendMessageToConnection(fromConn, message.data(), message.size(), k_nSteamNetworkingSend_Reliable, nullptr);
+        steamManager_->getInterface()->SendMessageToConnection(fromConn, message.data(), static_cast<uint32_t>(message.size()), k_nSteamNetworkingSend_Reliable, nullptr);
     }
 }
 
 void SteamVpnBridge::handleIpConflict(const uint8_t* data, size_t length, HSteamNetConnection fromConn) {
     if (length < 4) return;
-    
     uint32_t conflictIP;
     memcpy(&conflictIP, data, 4);
     conflictIP = ntohl(conflictIP);
     
-    if (negotiationState_ == IpNegotiationState::NEGOTIATING && conflictIP == candidateIP_) {
-        std::cout << "Received IP Conflict for candidate IP " << ipToString(conflictIP) << ". Retrying..." << std::endl;
-        startIpNegotiation(); 
-    } else    if (negotiationState_ == IpNegotiationState::STABLE && conflictIP == localIP_) {
-        std::cout << "Received IP Conflict for my stable IP " << ipToString(conflictIP) << ". Yielding and restarting negotiation." << std::endl;
+    if ((negotiationState_ == IpNegotiationState::NEGOTIATING && conflictIP == candidateIP_) ||
+        (negotiationState_ == IpNegotiationState::STABLE && conflictIP == localIP_)) {
         startIpNegotiation();
     }
 }
 
 void SteamVpnBridge::printRoutingTable() {
     std::lock_guard<std::mutex> lock(routingMutex_);
-    std::cout << "\n=== Current VPN Routing Table ===" << std::endl;
-    std::cout << "Total entries: " << routingTable_.size() << std::endl;
-    for (const auto& entry : routingTable_) {
-        std::cout << "IP: " << ipToString(entry.first) 
-                  << " | Name: " << entry.second.name 
-                  << " | SteamID: " << entry.second.steamID.ConvertToUint64() 
-                  << " | Local: " << (entry.second.isLocal ? "Yes" : "No") 
-                  << std::endl;
-    }
-    std::cout << "=================================\n" << std::endl;
+    // 为了防止刷屏，可以注释掉
+    // std::cout << "Routing Table Size: " << routingTable_.size() << std::endl;
 }
 
 uint32_t SteamVpnBridge::findNextAvailableIP(uint32_t startIP) {
@@ -799,7 +662,6 @@ uint32_t SteamVpnBridge::findNextAvailableIP(uint32_t startIP) {
     
     uint32_t potentialIP = (baseIP_ & subnetMask_) | offset;
     
-    // 循环查找未被占用的IP
     int attempts = 0;
     while (usedIPs.count(potentialIP) && attempts < 254) {
         offset++;
@@ -809,54 +671,4 @@ uint32_t SteamVpnBridge::findNextAvailableIP(uint32_t startIP) {
     }
     
     return potentialIP;
-}
-
-void SteamVpnBridge::updateSystemRoute(uint32_t ip, bool add) {
-    if (!tunDevice_) return;
-
-    std::string ipStr = ipToString(ip);
-    std::string cmd;
-
-#ifdef _WIN32
-    uint32_t ifIndex = tunDevice_->get_interface_index();
-    if (ifIndex == 0) return;
-
-    if (add) {
-        // route add <ip> mask 255.255.255.255 <gateway> IF <index>
-        // 如果我们有本地IP，将其作为网关，这有助于Windows理解这是点对点连接
-        std::string gateway = (localIP_ != 0) ? ipToString(localIP_) : "0.0.0.0";
-        cmd = "route add " + ipStr + " mask 255.255.255.255 " + gateway + " IF " + std::to_string(ifIndex);
-    } else {
-        // route delete <ip>
-        cmd = "route delete " + ipStr;
-    }
-#elif defined(__APPLE__)
-    std::string devName = tunDevice_->get_device_name();
-    if (devName.empty()) return;
-
-    if (add) {
-        // route add -host <ip> -interface <dev>
-        cmd = "route add -host " + ipStr + " -interface " + devName;
-    } else {
-        // route delete -host <ip>
-        cmd = "route delete -host " + ipStr;
-    }
-#elif defined(__linux__)
-    std::string devName = tunDevice_->get_device_name();
-    if (devName.empty()) return;
-
-    if (add) {
-        // ip route add <ip>/32 dev <dev>
-        cmd = "ip route add " + ipStr + "/32 dev " + devName;
-    } else {
-        // ip route del <ip>/32 dev <dev>
-        cmd = "ip route del " + ipStr + "/32 dev " + devName;
-    }
-#endif
-
-    std::cout << "Executing system route command: " << cmd << std::endl;
-    int ret = system(cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "Failed to execute route command: " << cmd << ", return code: " << ret << std::endl;
-    }
 }

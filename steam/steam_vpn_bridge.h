@@ -223,9 +223,6 @@ private:
 
     // 打印当前路由表
     void printRoutingTable();
-
-    // 更新系统路由表
-    void updateSystemRoute(uint32_t ip, bool add);
 };
 
 #endif // STEAM_VPN_BRIDGE_H
