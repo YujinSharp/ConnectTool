@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #endif
 #include <algorithm>
+#include <set>
 
 SteamVpnBridge::SteamVpnBridge(SteamNetworkingManager* steamManager)
     : steamManager_(steamManager)
@@ -182,6 +183,8 @@ void SteamVpnBridge::tunReadThread() {
 
             // 查找路由
             HSteamNetConnection targetConn = k_HSteamNetConnection_Invalid;
+            std::vector<HSteamNetConnection> broadcastConns;
+
             {
                 std::lock_guard<std::mutex> lock(routingMutex_);
                 auto it = routingTable_.find(destIP);
@@ -196,15 +199,19 @@ void SteamVpnBridge::tunReadThread() {
                     }
                 } else {
                     // 如果是广播或未知目标，发送给所有连接
-                    // 这里简化处理，丢弃未知目标的包
-                    std::cerr << "TUN read thread: No route found for destination IP: " << ipToString(destIP) << ", dropping packet." << std::endl;
-                    std::lock_guard<std::mutex> lock2(statsMutex_);
-                    stats_.packetsDropped++;
-                    continue;
+                    std::cout << "TUN read thread: No route found for destination IP: " << ipToString(destIP) << ", broadcasting to all peers." << std::endl;
+                    
+                    std::set<HSteamNetConnection> uniqueConns;
+                    for (const auto& entry : routingTable_) {
+                        if (!entry.second.isLocal && entry.second.conn != k_HSteamNetConnection_Invalid) {
+                            uniqueConns.insert(entry.second.conn);
+                        }
+                    }
+                    broadcastConns.assign(uniqueConns.begin(), uniqueConns.end());
                 }
             }
 
-            if (targetConn != k_HSteamNetConnection_Invalid) {
+            if (targetConn != k_HSteamNetConnection_Invalid || !broadcastConns.empty()) {
                 // 封装VPN消息
                 std::vector<uint8_t> vpnPacket;
                 VpnMessageHeader header;
@@ -217,23 +224,48 @@ void SteamVpnBridge::tunReadThread() {
 
                 // 通过Steam发送
                 ISteamNetworkingSockets* steamInterface = steamManager_->getInterface();
-                EResult result = steamInterface->SendMessageToConnection(
-                    targetConn,
-                    vpnPacket.data(),
-                    vpnPacket.size(),
-                    k_nSteamNetworkingSend_Reliable,
-                    nullptr
-                );
+                
+                if (targetConn != k_HSteamNetConnection_Invalid) {
+                    EResult result = steamInterface->SendMessageToConnection(
+                        targetConn,
+                        vpnPacket.data(),
+                        vpnPacket.size(),
+                        k_nSteamNetworkingSend_Reliable,
+                        nullptr
+                    );
 
-                if (result == k_EResultOK) {
-                    std::cout << "TUN read thread: Successfully sent " << vpnPacket.size() << " bytes to Steam connection " << targetConn << std::endl;
-                    std::lock_guard<std::mutex> lock(statsMutex_);
-                    stats_.packetsSent++;
-                    stats_.bytesSent += bytesRead;
+                    if (result == k_EResultOK) {
+                        std::cout << "TUN read thread: Successfully sent " << vpnPacket.size() << " bytes to Steam connection " << targetConn << std::endl;
+                        std::lock_guard<std::mutex> lock(statsMutex_);
+                        stats_.packetsSent++;
+                        stats_.bytesSent += bytesRead;
+                    } else {
+                        std::cerr << "TUN read thread: Failed to send packet to Steam connection " << targetConn << ", result: " << result << std::endl;
+                        std::lock_guard<std::mutex> lock(statsMutex_);
+                        stats_.packetsDropped++;
+                    }
                 } else {
-                    std::cerr << "TUN read thread: Failed to send packet to Steam connection " << targetConn << ", result: " << result << std::endl;
-                    std::lock_guard<std::mutex> lock(statsMutex_);
-                    stats_.packetsDropped++;
+                    // 广播发送
+                    int sentCount = 0;
+                    for (auto conn : broadcastConns) {
+                        EResult result = steamInterface->SendMessageToConnection(
+                            conn,
+                            vpnPacket.data(),
+                            vpnPacket.size(),
+                            k_nSteamNetworkingSend_Reliable,
+                            nullptr
+                        );
+                        if (result == k_EResultOK) {
+                            sentCount++;
+                        }
+                    }
+                    
+                    if (sentCount > 0) {
+                        std::cout << "TUN read thread: Broadcasted packet to " << sentCount << " peers." << std::endl;
+                        std::lock_guard<std::mutex> lock(statsMutex_);
+                        stats_.packetsSent += sentCount;
+                        stats_.bytesSent += bytesRead * sentCount;
+                    }
                 }
             }
         } else if (bytesRead < 0) {
@@ -370,6 +402,14 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteam
                 }
 
                 if (conn != k_HSteamNetConnection_Invalid) {
+                    // Validate IP against our subnet
+                    if ((ipAddress & subnetMask_) != (baseIP_ & subnetMask_)) {
+                        std::cerr << "Ignoring route update for IP " << ipToString(ipAddress) 
+                                  << " (SteamID " << csteamID.ConvertToUint64() << ")"
+                                  << " because it does not match our subnet." << std::endl;
+                        continue;
+                    }
+
                     RouteEntry entry;
                     entry.steamID = csteamID;
                     entry.conn = conn;

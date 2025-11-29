@@ -50,9 +50,6 @@ void ConnectToolCore::shutdown() {
 void ConnectToolCore::update() {
     if (steamInitialized) {
         SteamAPI_RunCallbacks();
-        if (steamManager) {
-            steamManager->update();
-        }
     }
 }
 

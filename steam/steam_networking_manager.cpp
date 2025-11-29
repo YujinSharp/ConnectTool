@@ -206,20 +206,6 @@ void SteamNetworkingManager::stopMessageHandler()
     }
 }
 
-void SteamNetworkingManager::update()
-{
-    std::lock_guard<std::mutex> lock(connectionsMutex);
-    // Update ping to host/client connection
-    if (g_hConnection != k_HSteamNetConnection_Invalid)
-    {
-        SteamNetConnectionRealTimeStatus_t status;
-        if (m_pInterface->GetConnectionRealTimeStatus(g_hConnection, &status, 0, nullptr))
-        {
-            hostPing_ = status.m_nPing;
-        }
-    }
-}
-
 int SteamNetworkingManager::getConnectionPing(HSteamNetConnection conn) const
 {
     SteamNetConnectionRealTimeStatus_t status;
@@ -316,6 +302,7 @@ void SteamNetworkingManager::handleConnectionStatusChanged(SteamNetConnectionSta
         }
         
         // Update peer connections map
+        // Update peer connections map
         peerConnections_[remoteSteamID] = pInfo->m_hConn;
         
         // Log connection info
@@ -329,6 +316,11 @@ void SteamNetworkingManager::handleConnectionStatusChanged(SteamNetConnectionSta
                 hostPing_ = status.m_nPing;
             }
             std::cout << "Outgoing connection details: ping=" << status.m_nPing << "ms, relay=" << (info.m_idPOPRelay != 0 ? "yes" : "no") << std::endl;
+        }
+
+        // Notify VPN bridge of new user (Outgoing connection)
+        if (vpnBridge_) {
+            vpnBridge_->onUserJoined(remoteSteamID, pInfo->m_hConn);
         }
     }
     else if (pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ClosedByPeer || pInfo->m_info.m_eState == k_ESteamNetworkingConnectionState_ProblemDetectedLocally)

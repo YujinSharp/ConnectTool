@@ -57,9 +57,6 @@ public:
     void stopMessageHandler();
     SteamMessageHandler* getMessageHandler() { return messageHandler_; }
 
-    // Update user info (ping, relay status)
-    void update();
-
     // VPN Bridge
     void setVpnBridge(SteamVpnBridge* vpnBridge) { vpnBridge_ = vpnBridge; }
     SteamVpnBridge* getVpnBridge() { return vpnBridge_; }

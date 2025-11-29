@@ -198,6 +198,7 @@ int main(int argc, char** argv) {
     // Main loop
     while (true) {
         core.update();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Add a small delay to reduce CPU usage
     }
 
     return 0;
