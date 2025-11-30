@@ -115,11 +115,3 @@ add_custom_command(TARGET ConnectToolCore POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_SOURCE_DIR}/third_party/steamsdk/redistributable_bin/win64/steam_api64.dll"
     $<TARGET_FILE_DIR:ConnectToolCore>)
-
-# Copy wintun.dll if on Windows
-# if(WIN32)
-#     add_custom_command(TARGET ConnectToolCore POST_BUILD
-#         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-#         "${CMAKE_SOURCE_DIR}/third_party/wintun/bin/amd64/wintun.dll"
-#         $<TARGET_FILE_DIR:ConnectToolCore>)
-# endif()

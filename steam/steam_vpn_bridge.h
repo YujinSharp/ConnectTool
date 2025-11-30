@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <map>
 #include <vector>
 #include <string>
@@ -195,6 +196,7 @@ private:
     };
     std::vector<OutgoingPacket> sendQueue_;
     std::mutex sendQueueMutex_;
+    std::condition_variable sendQueueCv_;
 
     // IP协商相关
     enum class IpNegotiationState {

@@ -57,7 +57,6 @@ void SteamMessageHandler::pollLoop() {
                     if (manager_) {
                         SteamVpnBridge* bridge = manager_->getVpnBridge();
                         if (bridge) {
-                            std::cout << "SteamMessageHandler: Received VPN message, forwarding to bridge." << std::endl;
                             bridge->handleVpnMessage(data, size, conn);
                         }
                     }
@@ -71,12 +70,13 @@ void SteamMessageHandler::pollLoop() {
         if (totalMessages > 0) {
             currentPollInterval_ = 0; // 有消息，立即轮询
         } else {
-            // 无消息，逐渐增加间隔，最大10ms
-            currentPollInterval_ = std::min(currentPollInterval_ + 1, 10);
+            // 无消息，逐渐增加间隔，最大1ms (Reduced from 10ms for lower latency)
+            currentPollInterval_ = std::min(currentPollInterval_ + 1, 1);
         }
         
         if (currentPollInterval_ > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(currentPollInterval_));
+            // std::this_thread::sleep_for(std::chrono::milliseconds(currentPollInterval_));
+             std::this_thread::sleep_for(std::chrono::microseconds(100)); // Sleep 0.1ms
         } else {
             std::this_thread::yield();
         }

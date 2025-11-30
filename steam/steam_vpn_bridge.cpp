@@ -148,34 +148,23 @@ void SteamVpnBridge::tunReadThread() {
         int bytesRead = tunDevice_->read(buffer, sizeof(buffer));
         
         if (bytesRead > 0) {
-            // [DEBUG] 只要收到包就打印，这样即使路由表没命中，你也能知道网卡配置是对的
-            // 注意：不要在生产环境大量打印，会刷屏
-            // std::cout << "TUN RX: " << bytesRead << " bytes. ";
-
             // 提取目标IP
             uint32_t destIP = extractDestIP(buffer, bytesRead);
-            // uint32_t srcIP = extractSourceIP(buffer, bytesRead);
             
-            // std::cout << "Dst: " << ipToString(destIP) << std::endl;
-
             // 查找路由
             HSteamNetConnection targetConn = k_HSteamNetConnection_Invalid;
             std::vector<HSteamNetConnection> broadcastConns;
 
             bool routeFound = false;
-            {
-                std::lock_guard<std::mutex> lock(routingMutex_);
-                auto it = routingTable_.find(destIP);
-                if (it != routingTable_.end()) {
-                    targetConn = it->second.conn;
-                    routeFound = true;
-                } 
-            }
+            std::lock_guard<std::mutex> lock(routingMutex_);
+            auto it = routingTable_.find(destIP);
+            if (it != routingTable_.end()) {
+                targetConn = it->second.conn;
+                routeFound = true;
+            } 
 
-            // 如果没找到特定路由，但目标IP在我们的子网内，可以选择广播或者丢弃
-            // 这里为了演示 Ping 测试，如果未找到路由，我们仅打印Log，不发送（或者你可以选择广播）
             if (!routeFound) {
-                 // std::cout << "No route for " << ipToString(destIP) << " (ignoring)" << std::endl;
+                continue;
             }
 
             if (targetConn != k_HSteamNetConnection_Invalid) {
@@ -197,7 +186,7 @@ void SteamVpnBridge::tunReadThread() {
                     targetConn,
                     vpnPacket.data(),
                     static_cast<uint32_t>(vpnPacket.size()),
-                    k_nSteamNetworkingSend_Reliable, // VPN流量通常用Unreliable可能更好，但为了防止丢包先用Reliable
+                    k_nSteamNetworkingSend_UnreliableNoNagle,
                     nullptr
                 );
 
@@ -209,92 +198,14 @@ void SteamVpnBridge::tunReadThread() {
                     stats_.packetsDropped++;
                 }
             }
-        } else if (bytesRead < 0) {
-            // 在某些实现中，read返回-1且errno为EAGAIN表示无数据
-            // 这里简单休眠
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } else {
-            // bytesRead == 0
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
-        // 检查IP协商超时
         checkIpNegotiationTimeout();
     }
     
     std::cout << "TUN read thread stopped" << std::endl;
-}
-
-void SteamVpnBridge::tunWriteThread() {
-    std::cout << "TUN write thread started" << std::endl;
-    
-    while (running_) {
-        std::vector<OutgoingPacket> packetsToSend;
-        
-        {
-            std::lock_guard<std::mutex> lock(sendQueueMutex_);
-            if (!sendQueue_.empty()) {
-                packetsToSend = std::move(sendQueue_);
-                sendQueue_.clear();
-            }
-        }
-        
-        for (const auto& packet : packetsToSend) {
-            // 写入TUN设备
-            // 注意：Wintun 是 Layer 3 接口，直接写入 IP 包即可
-            int bytesWritten = tunDevice_->write(packet.data.data(), packet.data.size());
-            
-            std::lock_guard<std::mutex> lock(statsMutex_);
-            if (bytesWritten > 0) {
-                stats_.packetsReceived++;
-                stats_.bytesReceived += bytesWritten;
-            } else {
-                stats_.packetsDropped++;
-                // std::cerr << "TUN Write Error" << std::endl;
-            }
-        }
-        
-        // 如果没有包发送，休眠一小会儿避免空转
-        if (packetsToSend.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-    
-    std::cout << "TUN write thread stopped" << std::endl;
-}
-
-void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, HSteamNetConnection fromConn) {
-    if (length < sizeof(VpnMessageHeader)) {
-        return;
-    }
-
-    VpnMessageHeader header;
-    memcpy(&header, data, sizeof(VpnMessageHeader));
-    uint16_t payloadLength = ntohs(header.length);
-
-    if (length < sizeof(VpnMessageHeader) + payloadLength) {
-        return;
-    }
-
-    const uint8_t* payload = data + sizeof(VpnMessageHeader);
-
-    switch (header.type) {
-        case VpnMessageType::IP_PACKET: {
-            // 将IP包写入TUN设备
-            // [Debug] std::cout << "RX IP Packet from Conn " << fromConn << " Len: " << payloadLength << std::endl;
-            
-            OutgoingPacket packet;
-            packet.data.resize(payloadLength);
-            memcpy(packet.data.data(), payload, payloadLength);
-            packet.targetConn = fromConn;
-
-            std::lock_guard<std::mutex> lock(sendQueueMutex_);
-            sendQueue_.push_back(std::move(packet));
-            break;
-        }
-
-        case VpnMessageType::ROUTE_UPDATE: {
-            // 路由表更新
             size_t offset = 0;
             bool anyUpdate = false;
             while (offset + 12 <= payloadLength) {  // 12 = 8 (SteamID) + 4 (IP)
