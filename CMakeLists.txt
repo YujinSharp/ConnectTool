@@ -14,6 +14,9 @@ find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(absl CONFIG REQUIRED)
 
+# Find Asio
+find_package(asio CONFIG REQUIRED)
+
 # Add nanoid_cpp
 add_subdirectory(third_party/nanoid_cpp)
 
@@ -94,6 +97,7 @@ target_link_libraries(ConnectToolCore PRIVATE
     gRPC::grpc++
     absl::base
     absl::strings
+    asio
 )
 
 target_link_libraries(ConnectToolCore PRIVATE 

@@ -3,9 +3,6 @@ syntax = "proto3";
 package connecttool;
 
 service ConnectToolService {
-  // Steam Initialization
-  rpc InitSteam (InitSteamRequest) returns (InitSteamResponse);
-  
   // Lobby Management
   rpc CreateLobby (CreateLobbyRequest) returns (CreateLobbyResponse);
   rpc JoinLobby (JoinLobbyRequest) returns (JoinLobbyResponse);
@@ -17,12 +14,6 @@ service ConnectToolService {
   // VPN Management
   rpc GetVPNStatus (GetVPNStatusRequest) returns (GetVPNStatusResponse);
   rpc GetVPNRoutingTable (GetVPNRoutingTableRequest) returns (GetVPNRoutingTableResponse);
-}
-
-message InitSteamRequest {}
-message InitSteamResponse {
-  bool success = 1;
-  string message = 2;
 }
 
 message CreateLobbyRequest {}

@@ -5,11 +5,14 @@
 #include <chrono>
 #include <mutex>
 #include <cstdio>
+#include <csignal>
 
+#include <asio.hpp>
 #include <grpcpp/grpcpp.h>
 
 #include "protos/connect_tool.grpc.pb.h"
 #include "core/connect_tool_core.h"
+#include "core/asio_event_loop.h"
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -146,7 +149,75 @@ private:
     std::mutex mutex_;
 };
 
+// 信号处理
+std::unique_ptr<grpc::Server> g_server;
+std::atomic<bool> g_running{true};
+
+void signalHandler(int signal) {
+    std::cout << "\nReceived signal " << signal << ", shutting down..." << std::endl;
+    g_running = false;
+    AsioEventLoop::instance().stop();
+    if (g_server) {
+        g_server->Shutdown();
+    }
+}
+
+/**
+ * @brief 基于 Asio 的 Steam 回调定时器
+ * 
+ * 使用 Asio 定时器替代传统的 sleep 循环，实现更高效的事件驱动
+ */
+class SteamCallbackTimer {
+public:
+    SteamCallbackTimer(asio::io_context& io, ConnectToolCore* core, std::chrono::milliseconds interval)
+        : timer_(io)
+        , core_(core)
+        , interval_(interval)
+        , running_(false) {}
+
+    void start() {
+        running_ = true;
+        scheduleNext();
+    }
+
+    void stop() {
+        running_ = false;
+        timer_.cancel();
+    }
+
+private:
+    void scheduleNext() {
+        if (!running_) return;
+        
+        timer_.expires_after(interval_);
+        timer_.async_wait([this](const asio::error_code& ec) {
+            if (!ec && running_) {
+                core_->update();
+                scheduleNext();
+            }
+        });
+    }
+
+    asio::steady_timer timer_;
+    ConnectToolCore* core_;
+    std::chrono::milliseconds interval_;
+    std::atomic<bool> running_;
+};
+
 int main(int argc, char** argv) {
+    // 设置信号处理
+#ifdef _WIN32
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
+#else
+    struct sigaction sa;
+    sa.sa_handler = signalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+#endif
+
     // Initialize Core
     ConnectToolCore core;
     if (!core.initSteam()) {
@@ -154,17 +225,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // 获取 Asio 事件循环
+    auto& eventLoop = AsioEventLoop::instance();
+    auto& ioContext = eventLoop.getContext();
+
+    // 创建 Steam 回调定时器 (10ms 间隔)
+    SteamCallbackTimer steamTimer(ioContext, &core, std::chrono::milliseconds(10));
+    steamTimer.start();
+
     // Define server address based on platform
 #ifdef _WIN32
-    // On Windows, use a local file for UDS. 
-    // Note: Windows 10 Build 17134 (April 2018 Update) or later is required for AF_UNIX.
     std::string socket_path = "connect_tool.sock";
 #else
-    // On Unix/Linux, use /tmp
     std::string socket_path = "/tmp/connect_tool.sock";
 #endif
 
-    // Remove the socket file if it already exists to avoid "Address already in use"
+    // Remove the socket file if it already exists
     std::remove(socket_path.c_str());
 
     std::string server_address("unix:" + socket_path);
@@ -173,14 +249,31 @@ int main(int argc, char** argv) {
     ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
-    std::unique_ptr<Server> server(builder.BuildAndStart());
+    g_server = std::unique_ptr<Server>(builder.BuildAndStart());
+    
+    if (!g_server) {
+        std::cerr << "Failed to start gRPC server" << std::endl;
+        return 1;
+    }
+    
     std::cout << "Server listening on " << server_address << std::endl;
+    std::cout << "Press Ctrl+C to shutdown..." << std::endl;
 
-    // Main loop
-    while (true) {
-        core.update();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Add a small delay to reduce CPU usage
+    // 在后台线程运行 gRPC 服务器
+    std::thread grpcThread([&]() {
+        g_server->Wait();
+    });
+
+    // 在主线程运行 Asio 事件循环
+    eventLoop.run();
+
+    // 清理
+    steamTimer.stop();
+    
+    if (grpcThread.joinable()) {
+        grpcThread.join();
     }
 
+    std::cout << "Server shutdown complete." << std::endl;
     return 0;
 }
