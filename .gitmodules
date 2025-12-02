@@ -1,9 +1,3 @@
-[submodule "third_party/imgui"]
-	path = third_party/imgui
-	url = https://github.com/ocornut/imgui
 [submodule "third_party/nanoid_cpp"]
 	path = third_party/nanoid_cpp
 	url = https://github.com/mcmikecreations/nanoid_cpp
-[submodule "third_party/wintun"]
-	path = third_party/wintun
-	url = https://git.zx2c4.com/wintun
