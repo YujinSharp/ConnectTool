@@ -49,6 +49,9 @@ std::string httpGet(const std::string& url, std::string& error) {
         return "";
     }
     
+    // 设置超时时间为 3 秒
+    WinHttpSetTimeouts(hSession, 3000, 3000, 3000, 3000);
+    
     // 连接
     HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
     if (!hConnect) {
@@ -130,7 +133,8 @@ std::string httpGet(const std::string& url, std::string& error) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
     
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {

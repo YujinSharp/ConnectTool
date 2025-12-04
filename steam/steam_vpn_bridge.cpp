@@ -4,6 +4,7 @@
 #include <iostream>
 #include <cstring>
 #include <vector>
+#include <isteamnetworkingutils.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -26,6 +27,65 @@ SteamVpnBridge::~SteamVpnBridge() {
     stop();
 }
 
+/**
+ * @brief 查询 Steam Networking 的 MTU 数据大小限制
+ * @return 可用于发送的最大数据大小，失败时返回默认值
+ */
+static int querySteamMtuDataSize() {
+    ISteamNetworkingUtils* pUtils = SteamNetworkingUtils();
+    if (!pUtils) {
+        std::cerr << "[MTU] SteamNetworkingUtils not available, using default MTU" << std::endl;
+        return RECOMMENDED_MTU;  // 使用默认值
+    }
+    
+    int32 mtuDataSize = 0;
+    size_t cbResult = sizeof(mtuDataSize);
+    ESteamNetworkingConfigDataType dataType;
+    
+    ESteamNetworkingGetConfigValueResult result = pUtils->GetConfigValue(
+        k_ESteamNetworkingConfig_MTU_DataSize,
+        k_ESteamNetworkingConfig_Global,
+        0,  // scopeObj (ignored for global)
+        &dataType,
+        &mtuDataSize,
+        &cbResult
+    );
+    
+    if (result == k_ESteamNetworkingGetConfigValue_OK || 
+        result == k_ESteamNetworkingGetConfigValue_OKInherited) {
+        std::cout << "[MTU] Steam MTU_DataSize from API: " << mtuDataSize << " bytes" << std::endl;
+        return mtuDataSize;
+    } else {
+        std::cerr << "[MTU] Failed to query MTU_DataSize (result=" << result 
+                  << "), using default: " << RECOMMENDED_MTU << std::endl;
+        return RECOMMENDED_MTU;
+    }
+}
+
+/**
+ * @brief 计算适合的 TUN MTU
+ * @param steamMtuDataSize Steam 允许的最大不分片数据大小
+ * @return 应该设置给 TUN 设备的 MTU 值
+ */
+static int calculateTunMtu(int steamMtuDataSize) {
+    // 减去 VPN 封装开销: VpnMessageHeader (3) + VpnPacketWrapper (32) = 35 bytes
+    // 再减去一些安全余量 (15 bytes)
+    int tunMtu = steamMtuDataSize - static_cast<int>(VPN_MESSAGE_OVERHEAD) - 15;
+    
+    // 确保 MTU 在合理范围内
+    if (tunMtu < 576) {
+        tunMtu = 576;  // IPv4 最小 MTU
+    } else if (tunMtu > 1500) {
+        tunMtu = 1500;  // 以太网标准 MTU
+    }
+    
+    std::cout << "[MTU] Calculated TUN MTU: " << tunMtu 
+              << " (Steam limit: " << steamMtuDataSize 
+              << ", overhead: " << VPN_MESSAGE_OVERHEAD << ")" << std::endl;
+    
+    return tunMtu;
+}
+
 bool SteamVpnBridge::start(const std::string& tunDeviceName,
                             const std::string& virtualSubnet,
                             const std::string& subnetMask) {
@@ -36,7 +96,17 @@ bool SteamVpnBridge::start(const std::string& tunDeviceName,
 
     // 获取配置
     const auto& config = ConfigManager::instance().getConfig();
-    int mtu = config.vpn.default_mtu;
+    
+    // 运行时查询 Steam 的 MTU 数据大小限制，并计算合适的 TUN MTU
+    int steamMtuDataSize = querySteamMtuDataSize();
+    int mtu = calculateTunMtu(steamMtuDataSize);
+    
+    // 如果配置文件中的 MTU 比计算值更小，使用配置值（更保守）
+    if (config.vpn.default_mtu > 0 && config.vpn.default_mtu < mtu) {
+        std::cout << "[MTU] Using config MTU (" << config.vpn.default_mtu 
+                  << ") instead of calculated (" << mtu << ")" << std::endl;
+        mtu = config.vpn.default_mtu;
+    }
 
     // 创建TUN设备
     tunDevice_ = tun::create_tun();
@@ -53,7 +123,13 @@ bool SteamVpnBridge::start(const std::string& tunDeviceName,
 
     std::cout << "TUN device created: " << tunDevice_->get_device_name() << std::endl;
 
-    // 初始化IP地址池
+    // 设置 TUN 设备的 MTU
+    if (!tunDevice_->set_mtu(mtu)) {
+        std::cerr << "Failed to set TUN device MTU: " << tunDevice_->get_last_error() << std::endl;
+        return false;
+    }
+
+    std::cout << "TUN device MTU set to: " << mtu << std::endl;
     baseIP_ = stringToIp(virtualSubnet);
     if (baseIP_ == 0) {
         std::cerr << "Invalid virtual subnet: " << virtualSubnet << std::endl;
@@ -104,9 +180,6 @@ bool SteamVpnBridge::start(const std::string& tunDeviceName,
     running_ = true;
     tunReadThread_ = std::make_unique<std::thread>(&SteamVpnBridge::tunReadThread, this);
     
-    // 启动会话维护线程
-    sessionMaintenanceThread_ = std::make_unique<std::thread>(&SteamVpnBridge::sessionMaintenanceThread, this);
-
     std::cout << "Steam VPN bridge started successfully" << std::endl;
     return true;
 }
@@ -124,10 +197,6 @@ void SteamVpnBridge::stop() {
     // 等待线程结束
     if (tunReadThread_ && tunReadThread_->joinable()) {
         tunReadThread_->join();
-    }
-    
-    if (sessionMaintenanceThread_ && sessionMaintenanceThread_->joinable()) {
-        sessionMaintenanceThread_->join();
     }
 
     // 关闭TUN设备
@@ -240,48 +309,6 @@ void SteamVpnBridge::tunReadThread() {
     }
     
     std::cout << "TUN read thread stopped" << std::endl;
-}
-
-void SteamVpnBridge::sessionMaintenanceThread() {
-    std::cout << "Session maintenance thread started" << std::endl;
-    
-    // 会话检查间隔（10秒）
-    constexpr int SESSION_CHECK_INTERVAL_MS = 10000;
-    
-    while (running_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(SESSION_CHECK_INTERVAL_MS));
-        
-        if (!running_) break;
-        
-        // 获取房间内所有成员
-        auto members = steamManager_->getRoomMembers();
-        CSteamID mySteamID = SteamUser()->GetSteamID();
-        
-        for (const auto& memberID : members) {
-            if (memberID == mySteamID) continue;  // 跳过自己
-            
-            // 检查连接状态
-            if (!steamManager_->isPeerConnected(memberID)) {
-                std::cout << "[SessionMaintenance] Peer " << memberID.ConvertToUint64() 
-                          << " not connected, attempting to reconnect..." << std::endl;
-                
-                // 发送 SESSION_HELLO 重建会话
-                VpnMessageHeader helloMsg;
-                helloMsg.type = VpnMessageType::SESSION_HELLO;
-                helloMsg.length = 0;
-                
-                int flags = k_nSteamNetworkingSend_Reliable | k_nSteamNetworkingSend_AutoRestartBrokenSession;
-                steamManager_->sendMessageToUser(memberID, &helloMsg, sizeof(helloMsg), flags);
-                
-                // 如果本地已经有 IP，发送地址宣布
-                if (ipNegotiator_.getState() == NegotiationState::STABLE) {
-                    ipNegotiator_.sendAddressAnnounceTo(memberID);
-                }
-            }
-        }
-    }
-    
-    std::cout << "Session maintenance thread stopped" << std::endl;
 }
 
 void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, CSteamID senderSteamID) {
@@ -446,17 +473,12 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, CSteam
 void SteamVpnBridge::onUserJoined(CSteamID steamID) {
     std::cout << "User joined: " << steamID.ConvertToUint64() << std::endl;
     
-    // 主动发送 SESSION_HELLO 消息来初始化 P2P 会话
-    // 这会触发 ISteamNetworkingMessages 建立底层连接
-    VpnMessageHeader helloMsg;
-    helloMsg.type = VpnMessageType::SESSION_HELLO;
-    helloMsg.length = 0;
-    
-    int flags = k_nSteamNetworkingSend_Reliable | k_nSteamNetworkingSend_AutoRestartBrokenSession;
-    steamManager_->sendMessageToUser(steamID, &helloMsg, sizeof(helloMsg), flags);
-    std::cout << "Sent SESSION_HELLO to " << steamID.ConvertToUint64() << std::endl;
+    // 不再主动发送 SESSION_HELLO
+    // Steam 的 ISteamNetworkingMessages 会在发送实际消息时通过 
+    // k_nSteamNetworkingSend_AutoRestartBrokenSession 自动建立连接
     
     // 如果本地已经有稳定的 IP，发送自己的地址宣布给新加入的用户
+    // 这个消息本身会触发连接建立
     if (ipNegotiator_.getState() == NegotiationState::STABLE) {
         ipNegotiator_.sendAddressAnnounceTo(steamID);
         

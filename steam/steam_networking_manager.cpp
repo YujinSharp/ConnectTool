@@ -280,7 +280,7 @@ std::string SteamNetworkingManager::getPeerConnectionType(CSteamID peerID) const
             return "直连";
         }
     }
-    return "N/A";
+    return "本机";
 }
 
 void SteamNetworkingManager::startMessageHandler()

@@ -108,9 +108,6 @@ public:
 private:
     // TUN设备读取线程
     void tunReadThread();
-    
-    // 会话维护线程 - 定期检查并重连断开的会话
-    void sessionMaintenanceThread();
 
     // IP地址转字符串
     static std::string ipToString(uint32_t ip);
@@ -159,9 +156,6 @@ private:
 
     // TUN读取线程
     std::unique_ptr<std::thread> tunReadThread_;
-    
-    // 会话维护线程
-    std::unique_ptr<std::thread> sessionMaintenanceThread_;
 
     // 路由表（IP地址 -> 路由信息）
     std::map<uint32_t, RouteEntry> routingTable_;
