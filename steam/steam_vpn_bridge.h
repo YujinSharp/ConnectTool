@@ -88,6 +88,12 @@ public:
     void onUserLeft(CSteamID steamID);
 
     /**
+     * @brief 当收到 SESSION_HELLO 消息时，发送本地地址信息
+     * @param senderSteamID 发送者的 Steam ID
+     */
+    void onSessionHelloReceived(CSteamID senderSteamID);
+
+    /**
      * @brief 获取统计信息
      */
     struct Statistics {

@@ -84,9 +84,6 @@ void ConnectToolCore::leaveLobby() {
     if (roomManager) {
         roomManager->leaveLobby();
     }
-    if (steamManager) {
-        steamManager->clearPeers();
-    }
 }
 
 bool ConnectToolCore::isInLobby() const {

@@ -19,7 +19,7 @@ void SteamFriendsCallbacks::OnGameLobbyJoinRequested(GameLobbyJoinRequested_t *p
     {
         CSteamID lobbyID = pCallback->m_steamIDLobby;
         std::cout << "Lobby ID: " << lobbyID.ConvertToUint64() << std::endl;
-        if (!manager_->isConnected())
+        if (!manager_->isInRoom())
         {
             std::cout << "Joining lobby from request: " << lobbyID.ConvertToUint64() << std::endl;
             roomManager_->joinLobby(lobbyID);
@@ -101,21 +101,21 @@ void SteamMatchmakingCallbacks::OnLobbyEntered(LobbyEnter_t *pCallback)
             );
         }
         
-        // 添加所有已存在的大厅成员为节点（使用 ISteamNetworkingMessages 无需手动连接）
+        // 通知 VPN bridge 处理已存在的大厅成员
         CSteamID mySteamID = SteamUser()->GetSteamID();
         
         int numMembers = SteamMatchmaking()->GetNumLobbyMembers(pCallback->m_ulSteamIDLobby);
-        std::cout << "Adding " << (numMembers - 1) << " lobby members as peers..." << std::endl;
+        std::cout << "Found " << (numMembers - 1) << " other lobby members" << std::endl;
         
-        for (int i = 0; i < numMembers; ++i)
-        {
-            CSteamID memberID = SteamMatchmaking()->GetLobbyMemberByIndex(pCallback->m_ulSteamIDLobby, i);
-            
-            // 不添加自己
-            if (memberID != mySteamID)
-            {
-                std::cout << "Adding peer: " << memberID.ConvertToUint64() << std::endl;
-                manager_->addPeer(memberID);
+        // VPN bridge 会通过房间成员列表实时获取成员
+        // 这里只需要通知有新成员需要建立连接
+        if (manager_->getVpnBridge()) {
+            for (int i = 0; i < numMembers; ++i) {
+                CSteamID memberID = SteamMatchmaking()->GetLobbyMemberByIndex(pCallback->m_ulSteamIDLobby, i);
+                if (memberID != mySteamID) {
+                    std::cout << "Notifying VPN bridge about member: " << memberID.ConvertToUint64() << std::endl;
+                    manager_->getVpnBridge()->onUserJoined(memberID);
+                }
             }
         }
     }
@@ -135,24 +135,30 @@ void SteamMatchmakingCallbacks::OnLobbyChatUpdate(LobbyChatUpdate_t *pCallback)
     {
         std::cout << "User " << affectedUser.ConvertToUint64() << " entered lobby" << std::endl;
         
-        // 新成员加入，将其添加为节点
+        // 新成员加入，通知 VPN bridge
         if (affectedUser != mySteamID && roomManager_->getCurrentLobby().IsValid())
         {
-            std::cout << "Adding new peer: " << affectedUser.ConvertToUint64() << std::endl;
-            manager_->addPeer(affectedUser);
+            std::cout << "Notifying VPN bridge about new member: " << affectedUser.ConvertToUint64() << std::endl;
+            if (manager_->getVpnBridge()) {
+                manager_->getVpnBridge()->onUserJoined(affectedUser);
+            }
         }
     }
     else if (pCallback->m_rgfChatMemberStateChange & k_EChatMemberStateChangeLeft)
     {
         std::cout << "User " << affectedUser.ConvertToUint64() << " left lobby" << std::endl;
-        // 移除离开的节点
-        manager_->removePeer(affectedUser);
+        // 通知 VPN bridge 移除离开的节点
+        if (manager_->getVpnBridge()) {
+            manager_->getVpnBridge()->onUserLeft(affectedUser);
+        }
     }
     else if (pCallback->m_rgfChatMemberStateChange & k_EChatMemberStateChangeDisconnected)
     {
         std::cout << "User " << affectedUser.ConvertToUint64() << " disconnected from lobby" << std::endl;
-        // 移除断开连接的节点
-        manager_->removePeer(affectedUser);
+        // 通知 VPN bridge 移除断开连接的节点
+        if (manager_->getVpnBridge()) {
+            manager_->getVpnBridge()->onUserLeft(affectedUser);
+        }
     }
 }
 
@@ -194,17 +200,14 @@ void SteamRoomManager::leaveLobby()
 {
     if (currentLobby != k_steamIDNil)
     {
-        SteamMatchmaking()->LeaveLobby(currentLobby);
-        currentLobby = k_steamIDNil;
-        
-        // 清理所有节点
-        networkingManager_->clearPeers();
-
         // 【新增】自动关闭VPN
         if (networkingManager_->getVpnBridge()) {
             std::cout << "Auto-stopping VPN..." << std::endl;
             networkingManager_->getVpnBridge()->stop();
         }
+        
+        SteamMatchmaking()->LeaveLobby(currentLobby);
+        currentLobby = k_steamIDNil;
         
         // Clear Rich Presence when leaving lobby
         SteamFriends()->ClearRichPresence();

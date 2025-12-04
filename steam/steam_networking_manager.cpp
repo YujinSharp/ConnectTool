@@ -1,5 +1,6 @@
 #include "steam_networking_manager.h"
 #include "steam_vpn_bridge.h"
+#include "steam_room_manager.h"
 #include "config/config_manager.h"
 #include "net/vpn_protocol.h"
 #include <iostream>
@@ -13,13 +14,11 @@ void SteamNetworkingManager::OnSessionRequest(SteamNetworkingMessagesSessionRequ
     CSteamID remoteSteamID = pCallback->m_identityRemote.GetSteamID();
     std::cout << "[SteamNetworkingManager] Session request from " << remoteSteamID.ConvertToUint64() << std::endl;
     
-    // 自动接受来自已知节点的会话请求
-    {
-        std::lock_guard<std::mutex> lock(peersMutex_);
-        if (peers_.find(remoteSteamID) != peers_.end()) {
-            m_pMessagesInterface->AcceptSessionWithUser(pCallback->m_identityRemote);
-            std::cout << "[SteamNetworkingManager] Accepted session from known peer" << std::endl;
-        }
+    // 自动接受来自房间成员的会话请求
+    std::set<CSteamID> members = getRoomMembers();
+    if (members.find(remoteSteamID) != members.end()) {
+        m_pMessagesInterface->AcceptSessionWithUser(pCallback->m_identityRemote);
+        std::cout << "[SteamNetworkingManager] Accepted session from room member" << std::endl;
     }
 }
 
@@ -29,10 +28,33 @@ void SteamNetworkingManager::OnSessionFailed(SteamNetworkingMessagesSessionFaile
     CSteamID remoteSteamID = pCallback->m_info.m_identityRemote.GetSteamID();
     std::cout << "[SteamNetworkingManager] Session failed with " << remoteSteamID.ConvertToUint64() 
               << ": " << pCallback->m_info.m_szEndDebug << std::endl;
+    
+    // 检查用户是否仍在房间中，如果是则尝试重连
+    std::set<CSteamID> members = getRoomMembers();
+    if (members.find(remoteSteamID) != members.end()) {
+        std::cout << "[SteamNetworkingManager] User still in room, attempting to reconnect..." << std::endl;
+        
+        // 重新发送 SESSION_HELLO 消息来重建会话
+        // 使用 AutoRestartBrokenSession flag 让 Steam 自动处理重连
+        VpnMessageHeader helloMsg;
+        helloMsg.type = VpnMessageType::SESSION_HELLO;
+        helloMsg.length = 0;
+        
+        int flags = k_nSteamNetworkingSend_Reliable | k_nSteamNetworkingSend_AutoRestartBrokenSession;
+        sendMessageToUser(remoteSteamID, &helloMsg, sizeof(helloMsg), flags);
+        std::cout << "[SteamNetworkingManager] Sent reconnection SESSION_HELLO to " 
+                  << remoteSteamID.ConvertToUint64() << std::endl;
+        
+        // 如果有 VPN Bridge 并且已经有稳定的 IP，发送地址宣布
+        if (vpnBridge_ && vpnBridge_->isRunning()) {
+            vpnBridge_->onUserJoined(remoteSteamID);
+        }
+    }
 }
 
 SteamNetworkingManager::SteamNetworkingManager()
     : m_pMessagesInterface(nullptr)
+    , roomManager_(nullptr)
     , messageHandler_(nullptr)
     , vpnBridge_(nullptr)
 {
@@ -133,17 +155,14 @@ bool SteamNetworkingManager::initialize()
 
 void SteamNetworkingManager::shutdown()
 {
-    // 关闭所有会话
-    {
-        std::lock_guard<std::mutex> lock(peersMutex_);
-        for (const auto& peerID : peers_) {
-            SteamNetworkingIdentity identity;
-            identity.SetSteamID(peerID);
-            if (m_pMessagesInterface) {
-                m_pMessagesInterface->CloseSessionWithUser(identity);
-            }
+    // 关闭与房间成员的所有会话
+    std::set<CSteamID> members = getRoomMembers();
+    for (const auto& memberID : members) {
+        SteamNetworkingIdentity identity;
+        identity.SetSteamID(memberID);
+        if (m_pMessagesInterface) {
+            m_pMessagesInterface->CloseSessionWithUser(identity);
         }
-        peers_.clear();
     }
     
     SteamAPI_Shutdown();
@@ -156,6 +175,11 @@ bool SteamNetworkingManager::sendMessageToUser(CSteamID peerID, const void* data
     SteamNetworkingIdentity identity;
     identity.SetSteamID(peerID);
     
+    // 对于可靠消息，自动添加 AutoRestartBrokenSession flag 以支持断线重连
+    if (flags & k_nSteamNetworkingSend_Reliable) {
+        flags |= k_nSteamNetworkingSend_AutoRestartBrokenSession;
+    }
+    
     EResult result = m_pMessagesInterface->SendMessageToUser(identity, data, size, flags, VPN_CHANNEL);
     return result == k_EResultOK;
 }
@@ -164,97 +188,47 @@ void SteamNetworkingManager::broadcastMessage(const void* data, uint32_t size, i
 {
     if (!m_pMessagesInterface) return;
     
-    std::lock_guard<std::mutex> lock(peersMutex_);
-    for (const auto& peerID : peers_) {
+    // 对于可靠消息，自动添加 AutoRestartBrokenSession flag 以支持断线重连
+    if (flags & k_nSteamNetworkingSend_Reliable) {
+        flags |= k_nSteamNetworkingSend_AutoRestartBrokenSession;
+    }
+    
+    // 实时从房间获取成员列表
+    std::set<CSteamID> members = getRoomMembers();
+    for (const auto& memberID : members) {
         SteamNetworkingIdentity identity;
-        identity.SetSteamID(peerID);
+        identity.SetSteamID(memberID);
         m_pMessagesInterface->SendMessageToUser(identity, data, size, flags, VPN_CHANNEL);
     }
 }
 
-void SteamNetworkingManager::addPeer(CSteamID peerID)
+std::set<CSteamID> SteamNetworkingManager::getRoomMembers() const
 {
-    // 不添加自己
-    if (peerID == SteamUser()->GetSteamID()) return;
+    std::set<CSteamID> members;
     
-    bool isNewPeer = false;
-    {
-        std::lock_guard<std::mutex> lock(peersMutex_);
-        isNewPeer = peers_.insert(peerID).second;
+    if (!roomManager_) return members;
+    
+    CSteamID currentLobby = roomManager_->getCurrentLobby();
+    if (!currentLobby.IsValid()) return members;
+    
+    CSteamID mySteamID = SteamUser()->GetSteamID();
+    int numMembers = SteamMatchmaking()->GetNumLobbyMembers(currentLobby);
+    
+    for (int i = 0; i < numMembers; ++i) {
+        CSteamID memberID = SteamMatchmaking()->GetLobbyMemberByIndex(currentLobby, i);
+        // 不包含自己
+        if (memberID != mySteamID) {
+            members.insert(memberID);
+        }
     }
     
-    if (isNewPeer) {
-        std::cout << "[SteamNetworkingManager] Added peer: " << peerID.ConvertToUint64() << std::endl;
-        
-        // 主动发送 SESSION_HELLO 消息来初始化 P2P 会话
-        // 这会触发 ISteamNetworkingMessages 建立底层连接
-        VpnMessageHeader helloMsg;
-        helloMsg.type = VpnMessageType::SESSION_HELLO;
-        helloMsg.length = 0;
-        
-        SteamNetworkingIdentity identity;
-        identity.SetSteamID(peerID);
-        
-        // 使用可靠发送 + 自动重启断开的会话
-        int flags = k_nSteamNetworkingSend_Reliable | k_nSteamNetworkingSend_AutoRestartBrokenSession;
-        EResult result = m_pMessagesInterface->SendMessageToUser(identity, &helloMsg, sizeof(helloMsg), flags, VPN_CHANNEL);
-        
-        if (result == k_EResultOK) {
-            std::cout << "[SteamNetworkingManager] Sent SESSION_HELLO to " << peerID.ConvertToUint64() << std::endl;
-        } else {
-            std::cout << "[SteamNetworkingManager] Failed to send SESSION_HELLO to " << peerID.ConvertToUint64() 
-                      << ", result: " << result << std::endl;
-        }
-        
-        // 通知 VPN bridge
-        if (vpnBridge_) {
-            vpnBridge_->onUserJoined(peerID);
-        }
-    }
+    return members;
 }
 
-void SteamNetworkingManager::removePeer(CSteamID peerID)
+bool SteamNetworkingManager::isInRoom() const
 {
-    std::lock_guard<std::mutex> lock(peersMutex_);
-    if (peers_.erase(peerID) > 0) {
-        std::cout << "[SteamNetworkingManager] Removed peer: " << peerID.ConvertToUint64() << std::endl;
-        
-        // 关闭会话
-        SteamNetworkingIdentity identity;
-        identity.SetSteamID(peerID);
-        if (m_pMessagesInterface) {
-            m_pMessagesInterface->CloseSessionWithUser(identity);
-        }
-        
-        // 通知 VPN bridge
-        if (vpnBridge_) {
-            vpnBridge_->onUserLeft(peerID);
-        }
-    }
-}
-
-void SteamNetworkingManager::clearPeers()
-{
-    std::lock_guard<std::mutex> lock(peersMutex_);
-    for (const auto& peerID : peers_) {
-        SteamNetworkingIdentity identity;
-        identity.SetSteamID(peerID);
-        if (m_pMessagesInterface) {
-            m_pMessagesInterface->CloseSessionWithUser(identity);
-        }
-        
-        if (vpnBridge_) {
-            vpnBridge_->onUserLeft(peerID);
-        }
-    }
-    peers_.clear();
-    std::cout << "[SteamNetworkingManager] Cleared all peers" << std::endl;
-}
-
-std::set<CSteamID> SteamNetworkingManager::getPeers() const
-{
-    std::lock_guard<std::mutex> lock(peersMutex_);
-    return peers_;
+    if (!roomManager_) return false;
+    return roomManager_->getCurrentLobby().IsValid();
 }
 
 int SteamNetworkingManager::getPeerPing(CSteamID peerID) const

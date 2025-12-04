@@ -188,14 +188,14 @@ void SteamVpnBridge::tunReadThread() {
             uint32_t vpnPacketSize = static_cast<uint32_t>(sizeof(VpnMessageHeader) + totalPayloadSize);
 
             if (isBroadcastAddress(destIP)) {
-                // 广播包 - 发送给所有已知节点
+                // 广播包 - 发送给房间内所有成员
                 steamManager_->broadcastMessage(vpnPacket, vpnPacketSize, 
                     k_nSteamNetworkingSend_UnreliableNoNagle | k_nSteamNetworkingSend_NoDelay);
                 
-                auto peers = steamManager_->getPeers();
+                auto members = steamManager_->getRoomMembers();
                 std::lock_guard<std::mutex> lock(statsMutex_);
-                stats_.packetsSent += peers.size();
-                stats_.bytesSent += bytesRead * peers.size();
+                stats_.packetsSent += members.size();
+                stats_.bytesSent += bytesRead * members.size();
             } else {
                 // 单播包 - 查找目标节点
                 CSteamID targetSteamID;
@@ -393,12 +393,35 @@ void SteamVpnBridge::handleVpnMessage(const uint8_t* data, size_t length, CSteam
 void SteamVpnBridge::onUserJoined(CSteamID steamID) {
     std::cout << "User joined: " << steamID.ConvertToUint64() << std::endl;
     
+    // 主动发送 SESSION_HELLO 消息来初始化 P2P 会话
+    // 这会触发 ISteamNetworkingMessages 建立底层连接
+    VpnMessageHeader helloMsg;
+    helloMsg.type = VpnMessageType::SESSION_HELLO;
+    helloMsg.length = 0;
+    
+    int flags = k_nSteamNetworkingSend_Reliable | k_nSteamNetworkingSend_AutoRestartBrokenSession;
+    steamManager_->sendMessageToUser(steamID, &helloMsg, sizeof(helloMsg), flags);
+    std::cout << "Sent SESSION_HELLO to " << steamID.ConvertToUint64() << std::endl;
+    
     // 如果本地已经有稳定的 IP，发送自己的地址宣布给新加入的用户
     if (ipNegotiator_.getState() == NegotiationState::STABLE) {
         ipNegotiator_.sendAddressAnnounceTo(steamID);
         
         // 同时把完整的路由表发送给新用户
         sendRouteUpdateTo(steamID);
+    }
+}
+
+void SteamVpnBridge::onSessionHelloReceived(CSteamID senderSteamID) {
+    std::cout << "Received SESSION_HELLO from " << senderSteamID.ConvertToUint64() << std::endl;
+    
+    // 如果本地已经有稳定的 IP，回复自己的地址宣布和路由表
+    // 这确保了即使 OnLobbyChatUpdate 回调时序有问题，对方也能收到我们的地址信息
+    if (ipNegotiator_.getState() == NegotiationState::STABLE) {
+        std::cout << "Replying with ADDRESS_ANNOUNCE and route table to " 
+                  << senderSteamID.ConvertToUint64() << std::endl;
+        ipNegotiator_.sendAddressAnnounceTo(senderSteamID);
+        sendRouteUpdateTo(senderSteamID);
     }
 }
 

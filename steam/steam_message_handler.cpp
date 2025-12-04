@@ -118,10 +118,19 @@ void SteamMessageHandler::pollMessages() {
         if (size >= sizeof(VpnMessageHeader)) {
             VpnMessageType msgType = static_cast<VpnMessageType>(data[0]);
             
-            // SESSION_HELLO 消息只是用于建立会话，不需要特殊处理
+            // SESSION_HELLO 消息用于建立会话，收到后应该回复自己的地址信息
             if (msgType == VpnMessageType::SESSION_HELLO) {
                 std::cout << "[SteamMessageHandler] Received SESSION_HELLO from " 
                           << senderSteamID.ConvertToUint64() << std::endl;
+                
+                // 回复自己的地址信息，确保双向同步
+                if (manager_) {
+                    SteamVpnBridge* bridge = manager_->getVpnBridge();
+                    if (bridge) {
+                        bridge->onSessionHelloReceived(senderSteamID);
+                    }
+                }
+                
                 pIncomingMsg->Release();
                 continue;
             }
