@@ -82,22 +82,27 @@ public:
      * @brief 处理探测请求
      */
     void handleProbeRequest(const ProbeRequestPayload& request, CSteamID senderSteamID);
+    void handleProbeRequest(const uint8_t* payload, size_t length, CSteamID senderSteamID);
     
     /**
      * @brief 处理探测响应
      */
     void handleProbeResponse(const ProbeResponsePayload& response, CSteamID senderSteamID);
+    void handleProbeResponse(const uint8_t* payload, size_t length, CSteamID senderSteamID);
     
     /**
      * @brief 处理地址宣布
      */
     void handleAddressAnnounce(const AddressAnnouncePayload& announce, CSteamID peerSteamID,
                                const std::string& peerName);
+    void handleAddressAnnounce(const uint8_t* payload, size_t length, CSteamID peerSteamID,
+                               const std::string& peerName);
     
     /**
      * @brief 处理强制释放
      */
     void handleForcedRelease(const ForcedReleasePayload& release, CSteamID senderSteamID);
+    void handleForcedRelease(const uint8_t* payload, size_t length, CSteamID senderSteamID);
     
     /**
      * @brief 获取当前状态

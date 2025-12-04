@@ -1,25 +1,24 @@
 #include "steam_networking_manager.h"
-#include "steam_vpn_bridge.h"
+#include "steam_message_handler.h"
 #include "steam_room_manager.h"
 #include "config/config_manager.h"
-#include "net/vpn_protocol.h"
 #include <iostream>
-#include <algorithm>
+#include <steam_api.h>
+#include <isteamnetworkingutils.h>
 
-SteamNetworkingManager *SteamNetworkingManager::instance = nullptr;
+SteamNetworkingManager* SteamNetworkingManager::instance = nullptr;
 
-// STEAM_CALLBACK 回调函数 - 当有新的会话请求时
+// STEAM_CALLBACK 回调函数 - 当收到会话请求时
 void SteamNetworkingManager::OnSessionRequest(SteamNetworkingMessagesSessionRequest_t *pCallback)
 {
-    CSteamID remoteSteamID = pCallback->m_identityRemote.GetSteamID();
-    std::cout << "[SteamNetworkingManager] Session request from " << remoteSteamID.ConvertToUint64() << std::endl;
+    std::cout << "[SteamNetworkingManager] Session request from " << pCallback->m_identityRemote.GetSteamID().ConvertToUint64() << std::endl;
     
-    // 始终接受会话请求
-    // 注意：即使请求者不在当前已知的房间成员列表中也要接受，
-    // 因为成员列表同步可能存在延迟，或者对方先发起了连接请求
+    // 接受所有来自房间成员的连接请求
+    // TODO: 添加更严格的验证
     m_pMessagesInterface->AcceptSessionWithUser(pCallback->m_identityRemote);
     
     std::set<CSteamID> members = getRoomMembers();
+    CSteamID remoteSteamID = pCallback->m_identityRemote.GetSteamID();
     if (members.find(remoteSteamID) != members.end()) {
         std::cout << "[SteamNetworkingManager] Accepted session from room member" << std::endl;
     } else {
@@ -33,28 +32,6 @@ void SteamNetworkingManager::OnSessionFailed(SteamNetworkingMessagesSessionFaile
     CSteamID remoteSteamID = pCallback->m_info.m_identityRemote.GetSteamID();
     std::cout << "[SteamNetworkingManager] Session failed with " << remoteSteamID.ConvertToUint64() 
               << ": " << pCallback->m_info.m_szEndDebug << std::endl;
-    
-    // 检查用户是否仍在房间中，如果是则尝试重连
-    std::set<CSteamID> members = getRoomMembers();
-    if (members.find(remoteSteamID) != members.end()) {
-        std::cout << "[SteamNetworkingManager] User still in room, attempting to reconnect..." << std::endl;
-        
-        // 重新发送 SESSION_HELLO 消息来重建会话
-        // 使用 AutoRestartBrokenSession flag 让 Steam 自动处理重连
-        VpnMessageHeader helloMsg;
-        helloMsg.type = VpnMessageType::SESSION_HELLO;
-        helloMsg.length = 0;
-        
-        int flags = k_nSteamNetworkingSend_Reliable | k_nSteamNetworkingSend_AutoRestartBrokenSession;
-        sendMessageToUser(remoteSteamID, &helloMsg, sizeof(helloMsg), flags);
-        std::cout << "[SteamNetworkingManager] Sent reconnection SESSION_HELLO to " 
-                  << remoteSteamID.ConvertToUint64() << std::endl;
-        
-        // 如果有 VPN Bridge 并且已经有稳定的 IP，发送地址宣布
-        if (vpnBridge_ && vpnBridge_->isRunning()) {
-            vpnBridge_->onUserJoined(remoteSteamID);
-        }
-    }
 }
 
 SteamNetworkingManager::SteamNetworkingManager()
@@ -209,25 +186,8 @@ void SteamNetworkingManager::broadcastMessage(const void* data, uint32_t size, i
 
 std::set<CSteamID> SteamNetworkingManager::getRoomMembers() const
 {
-    std::set<CSteamID> members;
-    
-    if (!roomManager_) return members;
-    
-    CSteamID currentLobby = roomManager_->getCurrentLobby();
-    if (!currentLobby.IsValid()) return members;
-    
-    CSteamID mySteamID = SteamUser()->GetSteamID();
-    int numMembers = SteamMatchmaking()->GetNumLobbyMembers(currentLobby);
-    
-    for (int i = 0; i < numMembers; ++i) {
-        CSteamID memberID = SteamMatchmaking()->GetLobbyMemberByIndex(currentLobby, i);
-        // 不包含自己
-        if (memberID != mySteamID) {
-            members.insert(memberID);
-        }
-    }
-    
-    return members;
+    if (!roomManager_) return std::set<CSteamID>();
+    return roomManager_->getMembers(false);
 }
 
 bool SteamNetworkingManager::isInRoom() const
@@ -275,12 +235,14 @@ std::string SteamNetworkingManager::getPeerConnectionType(CSteamID peerID) const
     
     if (state == k_ESteamNetworkingConnectionState_Connected) {
         if (info.m_nFlags & k_nSteamNetworkConnectionInfoFlags_Relayed) {
-            return "中继";
+            return "Relay";
         } else {
-            return "直连";
+            return "Direct";
         }
+    } else if (peerID == SteamUser()->GetSteamID()) {
+        return "Local";
     }
-    return "本机";
+    return "Disconnected";
 }
 
 void SteamNetworkingManager::startMessageHandler()

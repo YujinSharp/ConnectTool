@@ -353,3 +353,36 @@ void IpNegotiator::markIPUnused(uint32_t ip) {
     std::lock_guard<std::mutex> lock(usedIPsMutex_);
     usedIPs_.erase(ip);
 }
+
+void IpNegotiator::handleProbeRequest(const uint8_t* payload, size_t length, CSteamID senderSteamID) {
+    if (length >= sizeof(ProbeRequestPayload)) {
+        ProbeRequestPayload request;
+        memcpy(&request, payload, sizeof(ProbeRequestPayload));
+        handleProbeRequest(request, senderSteamID);
+    }
+}
+
+void IpNegotiator::handleProbeResponse(const uint8_t* payload, size_t length, CSteamID senderSteamID) {
+    if (length >= sizeof(ProbeResponsePayload)) {
+        ProbeResponsePayload response;
+        memcpy(&response, payload, sizeof(ProbeResponsePayload));
+        handleProbeResponse(response, senderSteamID);
+    }
+}
+
+void IpNegotiator::handleAddressAnnounce(const uint8_t* payload, size_t length, CSteamID peerSteamID,
+                                         const std::string& peerName) {
+    if (length >= sizeof(AddressAnnouncePayload)) {
+        AddressAnnouncePayload announce;
+        memcpy(&announce, payload, sizeof(AddressAnnouncePayload));
+        handleAddressAnnounce(announce, peerSteamID, peerName);
+    }
+}
+
+void IpNegotiator::handleForcedRelease(const uint8_t* payload, size_t length, CSteamID senderSteamID) {
+    if (length >= sizeof(ForcedReleasePayload)) {
+        ForcedReleasePayload release;
+        memcpy(&release, payload, sizeof(ForcedReleasePayload));
+        handleForcedRelease(release, senderSteamID);
+    }
+}

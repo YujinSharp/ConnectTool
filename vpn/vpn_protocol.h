@@ -58,9 +58,6 @@ enum class VpnMessageType : uint8_t {
     FORCED_RELEASE = 13,        // 强制释放指令
     HEARTBEAT = 14,             // 心跳/续租包
     HEARTBEAT_ACK = 15,         // 心跳确认
-    
-    // 会话管理消息
-    SESSION_HELLO = 20          // 会话初始化消息（用于建立 P2P 连接）
 };
 
 // ============================================================================

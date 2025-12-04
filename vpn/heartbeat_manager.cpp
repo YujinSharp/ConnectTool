@@ -186,6 +186,15 @@ std::map<NodeID, NodeInfo> HeartbeatManager::getAllNodes() const {
     return nodeTable_;
 }
 
+void HeartbeatManager::handleHeartbeat(const uint8_t* payload, size_t length, CSteamID peerSteamID,
+                                       const std::string& peerName) {
+    if (length >= sizeof(HeartbeatPayload)) {
+        HeartbeatPayload heartbeat;
+        memcpy(&heartbeat, payload, sizeof(HeartbeatPayload));
+        handleHeartbeat(heartbeat, peerSteamID, peerName);
+    }
+}
+
 bool HeartbeatManager::detectConflict(uint32_t sourceIP, const NodeID& senderNodeId, CSteamID& outConflictingSteamID) {
     std::lock_guard<std::mutex> lock(nodeTableMutex_);
     

@@ -68,6 +68,8 @@ public:
      */
     void handleHeartbeat(const HeartbeatPayload& heartbeat, CSteamID peerSteamID,
                          const std::string& peerName);
+    void handleHeartbeat(const uint8_t* payload, size_t length, CSteamID peerSteamID,
+                         const std::string& peerName);
     
     /**
      * @brief 注册远程节点

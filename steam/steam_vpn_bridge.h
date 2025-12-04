@@ -13,9 +13,10 @@
 #include <isteamnetworkingmessages.h>
 
 #include "../tun/tun_interface.h"
-#include "../net/vpn_protocol.h"
-#include "../net/ip_negotiator.h"
-#include "../net/heartbeat_manager.h"
+#include "../vpn/vpn_protocol.h"
+#include "../vpn/ip_negotiator.h"
+#include "../vpn/heartbeat_manager.h"
+#include "../vpn/vpn_route_manager.h"
 
 // Forward declarations
 class SteamNetworkingManager;
@@ -88,12 +89,6 @@ public:
     void onUserLeft(CSteamID steamID);
 
     /**
-     * @brief 当收到 SESSION_HELLO 消息时，发送本地地址信息
-     * @param senderSteamID 发送者的 Steam ID
-     */
-    void onSessionHelloReceived(CSteamID senderSteamID);
-
-    /**
      * @brief 获取统计信息
      */
     struct Statistics {
@@ -109,21 +104,6 @@ private:
     // TUN设备读取线程
     void tunReadThread();
 
-    // IP地址转字符串
-    static std::string ipToString(uint32_t ip);
-
-    // 字符串转IP地址
-    static uint32_t stringToIp(const std::string& ipStr);
-
-    // 从IP包中提取目标地址
-    static uint32_t extractDestIP(const uint8_t* packet, size_t length);
-
-    // 从IP包中提取源地址
-    static uint32_t extractSourceIP(const uint8_t* packet, size_t length);
-
-    // 判断是否是广播地址
-    bool isBroadcastAddress(uint32_t ip) const;
-    
     // 发送 VPN 消息（使用 ISteamNetworkingMessages）
     void sendVpnMessage(VpnMessageType type, const uint8_t* payload, size_t payloadLength, 
                         CSteamID targetSteamID, bool reliable = true);
@@ -135,15 +115,6 @@ private:
     
     // 节点过期回调
     void onNodeExpired(const NodeID& nodeId, uint32_t ipAddress);
-    
-    // 更新路由表
-    void updateRoute(const NodeID& nodeId, CSteamID steamId, uint32_t ipAddress,
-                     const std::string& name);
-    void removeRoute(uint32_t ipAddress);
-    
-    // 发送路由更新
-    void broadcastRouteUpdate();
-    void sendRouteUpdateTo(CSteamID targetSteamID);
 
     // Steam网络管理器
     SteamNetworkingManager* steamManager_;
@@ -157,15 +128,13 @@ private:
     // TUN读取线程
     std::unique_ptr<std::thread> tunReadThread_;
 
-    // 路由表（IP地址 -> 路由信息）
-    std::map<uint32_t, RouteEntry> routingTable_;
-    mutable std::mutex routingMutex_;
+    // 路由管理器
+    VpnRouteManager routeManager_;
 
     // IP地址池配置
     uint32_t baseIP_;
     uint32_t subnetMask_;
-
-    // 本地IP地址
+    
     uint32_t localIP_;
 
     // 统计信息

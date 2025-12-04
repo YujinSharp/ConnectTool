@@ -1,7 +1,7 @@
 #include "steam_message_handler.h"
 #include "steam_networking_manager.h"
 #include "steam_vpn_bridge.h"
-#include "net/vpn_protocol.h"
+#include "vpn/vpn_protocol.h"
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -116,25 +116,6 @@ void SteamMessageHandler::pollMessages() {
 
         // Check if this is a VPN message
         if (size >= sizeof(VpnMessageHeader)) {
-            VpnMessageType msgType = static_cast<VpnMessageType>(data[0]);
-            
-            // SESSION_HELLO 消息用于建立会话，收到后应该回复自己的地址信息
-            if (msgType == VpnMessageType::SESSION_HELLO) {
-                std::cout << "[SteamMessageHandler] Received SESSION_HELLO from " 
-                          << senderSteamID.ConvertToUint64() << std::endl;
-                
-                // 回复自己的地址信息，确保双向同步
-                if (manager_) {
-                    SteamVpnBridge* bridge = manager_->getVpnBridge();
-                    if (bridge) {
-                        bridge->onSessionHelloReceived(senderSteamID);
-                    }
-                }
-                
-                pIncomingMsg->Release();
-                continue;
-            }
-            
             // Forward other VPN messages to VPN bridge
             if (manager_) {
                 SteamVpnBridge* bridge = manager_->getVpnBridge();

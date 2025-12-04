@@ -102,20 +102,15 @@ void SteamMatchmakingCallbacks::OnLobbyEntered(LobbyEnter_t *pCallback)
         }
         
         // 通知 VPN bridge 处理已存在的大厅成员
-        CSteamID mySteamID = SteamUser()->GetSteamID();
-        
-        int numMembers = SteamMatchmaking()->GetNumLobbyMembers(pCallback->m_ulSteamIDLobby);
-        std::cout << "Found " << (numMembers - 1) << " other lobby members" << std::endl;
+        std::set<CSteamID> members = roomManager_->getMembers(false);
+        std::cout << "Found " << members.size() << " other lobby members" << std::endl;
         
         // VPN bridge 会通过房间成员列表实时获取成员
         // 这里只需要通知有新成员需要建立连接
         if (manager_->getVpnBridge()) {
-            for (int i = 0; i < numMembers; ++i) {
-                CSteamID memberID = SteamMatchmaking()->GetLobbyMemberByIndex(pCallback->m_ulSteamIDLobby, i);
-                if (memberID != mySteamID) {
-                    std::cout << "Notifying VPN bridge about member: " << memberID.ConvertToUint64() << std::endl;
-                    manager_->getVpnBridge()->onUserJoined(memberID);
-                }
+            for (const auto& memberID : members) {
+                std::cout << "Notifying VPN bridge about member: " << memberID.ConvertToUint64() << std::endl;
+                manager_->getVpnBridge()->onUserJoined(memberID);
             }
         }
     }
@@ -230,8 +225,7 @@ bool SteamRoomManager::searchLobbies()
 
 bool SteamRoomManager::joinLobby(CSteamID lobbyID)
 {
-    // 使用 ISteamNetworkingMessages 不需要创建 listen socket
-    std::cout << "Joining lobby (using ISteamNetworkingMessages, no listen socket needed)" << std::endl;
+    std::cout << "Joining lobby " << lobbyID.ConvertToUint64() << std::endl;
     
     SteamAPICall_t hCall = SteamMatchmaking()->JoinLobby(lobbyID);
     if (hCall == k_uAPICallInvalid)
@@ -245,14 +239,23 @@ bool SteamRoomManager::joinLobby(CSteamID lobbyID)
 
 std::vector<CSteamID> SteamRoomManager::getLobbyMembers() const
 {
-    std::vector<CSteamID> members;
+    std::set<CSteamID> memberSet = getMembers(true);
+    return std::vector<CSteamID>(memberSet.begin(), memberSet.end());
+}
+
+std::set<CSteamID> SteamRoomManager::getMembers(bool includeSelf) const
+{
+    std::set<CSteamID> members;
     if (currentLobby != k_steamIDNil)
     {
+        CSteamID mySteamID = SteamUser()->GetSteamID();
         int numMembers = SteamMatchmaking()->GetNumLobbyMembers(currentLobby);
         for (int i = 0; i < numMembers; ++i)
         {
             CSteamID memberID = SteamMatchmaking()->GetLobbyMemberByIndex(currentLobby, i);
-            members.push_back(memberID);
+            if (includeSelf || memberID != mySteamID) {
+                members.insert(memberID);
+            }
         }
     }
     return members;

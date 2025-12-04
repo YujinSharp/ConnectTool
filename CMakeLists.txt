@@ -78,9 +78,11 @@ generate_grpc_proto(${PROTO_SRC_DIR}/connect_tool.proto)
 
 # Net module sources
 set(NET_SOURCES
-    net/node_identity.cpp
-    net/ip_negotiator.cpp
-    net/heartbeat_manager.cpp
+    vpn/node_identity.cpp
+    vpn/ip_negotiator.cpp
+    vpn/heartbeat_manager.cpp
+    vpn/vpn_utils.cpp
+    vpn/vpn_route_manager.cpp
 )
 
 # Config module sources
@@ -101,6 +103,7 @@ add_executable(ConnectToolCore
     steam/steam_room_manager.cpp 
     steam/steam_utils.cpp 
     steam/steam_vpn_bridge.cpp
+    steam/steam_vpn_utils.cpp
     ${NET_SOURCES}
     ${CONFIG_SOURCES}
     ${TUN_SOURCES}
